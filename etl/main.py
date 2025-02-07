@@ -92,10 +92,12 @@ def ensure_infos_especes_filled(
         # 3.3 Read xlsx into pandas
         df = pd.read_excel(local_xlsx_path)
 
-        # Handle infinite values by converting them to NaN,
-        # then fill all NaN with None so the JSON payload is valid
+        # Handle infinite values by converting them to NaN.
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.fillna(value=None, inplace=True)
+
+        # Instead of fillna(value=None), we'll convert NaN -> None using 'where' so that JSON is valid.
+        # This approach ensures that nulls become Python None, which supabase-py can serialize as JSON null.
+        df = df.where(df.notnull(), None)
 
         # Let's rename columns if needed (replace spaces with underscores).
         rename_map = {}
