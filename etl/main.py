@@ -229,10 +229,10 @@ def fetch_species_map(supabase: Client) -> dict:
     Returns a dictionary mapping the infos_especes.Espece to its id.
     For example: { 'Hippopotame': 10, 'Chien': 11 }
     """
-    data = supabase.table("infos_especes").select("id, Espece").execute()
+    data = supabase.table("infos_especes").select("id, Espèce").execute()
     species_map = {}
     for row in data.data:
-        species_name = row.get("Espece")
+        species_name = row.get("Espèce")
         species_id = row.get("id")
         species_map[species_name] = species_id
     return species_map
