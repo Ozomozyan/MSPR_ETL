@@ -20,10 +20,11 @@ Environment Variables:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 - GOOGLE_APPLICATION_CREDENTIALS (file path to your service account JSON)
+- GCS_BUCKET_NAME (the name of your Google Cloud Storage bucket)
 
 Additional assumptions:
 - The table "infos_especes" has an auto-increment primary key (id) and columns like:
-    id (pk), Espece (string), Description (string), etc.
+    id (pk), Espèce (string), Description (string), etc.
 - The table "footprint_images" has columns:
     id (pk), species_id (fk to infos_especes.id), image_name (string), image_url (string)
 - This script relies on the supabase-py client, google-cloud-storage, pandas (for xlsx->csv), Pillow, etc.
@@ -95,14 +96,13 @@ def ensure_infos_especes_filled(
         # Handle infinite values by converting them to NaN.
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # Instead of fillna(value=None), we'll convert NaN -> None using 'where' so that JSON is valid.
-        # This approach ensures that nulls become Python None, which supabase-py can serialize as JSON null.
+        # Convert NaN -> None, so supabase-py can serialize null values properly
         df = df.where(df.notnull(), None)
 
-        # Let's rename columns if needed (replace spaces with underscores).
+        # Rename columns if needed (replace spaces with underscores).
         rename_map = {}
         for col in df.columns:
-            clean_col = re.sub(r"\\s+", "_", col.strip())  # replace whitespace with underscores
+            clean_col = re.sub(r"\s+", "_", col.strip())  # replace whitespace with underscores
             rename_map[col] = clean_col
         df.rename(columns=rename_map, inplace=True)
 
@@ -135,6 +135,7 @@ def process_images(
 
     # 4.1 Get existing species from infos_especes to map species name -> ID
     species_map = fetch_species_map(supabase)
+    print("Species map from DB:", species_map)
 
     # 4.2 List all blobs in raw_folder_prefix (e.g. Mammifères/<SpeciesName>/...)
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
@@ -149,8 +150,14 @@ def process_images(
             # e.g. Mammifères/ + filename => 2 parts, no species subfolder
             print(f"Skipping {blob.name}, no subfolder structure.")
             continue
+
+        # path_parts[1] is the species folder name
         species_name = path_parts[1]
         image_filename = path_parts[-1]
+
+        # Debug print
+        print(f"Found blob: {blob.name}, species_name: {species_name}, image_filename: {image_filename}")
+
         image_candidates.append((blob.name, species_name, image_filename))
 
     # 4.3 Create local temp folders
@@ -164,7 +171,7 @@ def process_images(
     images_to_upload = []  # list of (local_path, species_name, new_filename)
 
     for blob_name, species_name, image_filename in image_candidates:
-        # If there's no matching species, skip
+        # If there's no matching species in the DB map, skip
         if species_name not in species_map:
             print(f"Species '{species_name}' not found in infos_especes. Skipping {blob_name}.")
             continue
@@ -195,7 +202,7 @@ def process_images(
         local_processed_path = os.path.join(local_temp_processed, processed_filename)
         try:
             with Image.open(local_download_path) as img:
-                # Example resize to 128x128
+                # Example: resize to 128x128
                 img_resized = img.resize((128, 128))
                 img_resized.save(local_processed_path)
         except Exception as e:
@@ -212,12 +219,16 @@ def process_images(
         # Optionally make public
         new_blob.make_public()
 
+        # Insert record in footprint_images
         record = {
             "species_id": species_map[species_name],
             "image_name": processed_filename,
             "image_url": new_blob.public_url,
         }
         supabase.table("footprint_images").insert(record).execute()
+
+        # Debug print
+        print(f"Uploaded '{processed_filename}' to '{new_blob_path}', URL = {new_blob.public_url}")
 
     print("Image processing and insertion complete.")
 
@@ -226,13 +237,17 @@ def process_images(
 # ------------------------------------------------------------------------------
 def fetch_species_map(supabase: Client) -> dict:
     """
-    Returns a dictionary mapping the infos_especes.Espece to its id.
+    Returns a dictionary mapping the infos_especes.Espèce (or Espece) to its id.
     For example: { 'Hippopotame': 10, 'Chien': 11 }
+
+    IMPORTANT:
+    If your DB column is spelled 'Espece' without the accent, use .select(\"id, Espece\").
+    If your DB column is spelled 'Espèce' with the accent, use .select(\"id, Espèce\").
     """
     data = supabase.table("infos_especes").select("id, Espèce").execute()
     species_map = {}
     for row in data.data:
-        species_name = row.get("Espèce")
+        species_name = row.get("Espèce")  # or row.get("Espece")
         species_id = row.get("id")
         species_map[species_name] = species_id
     return species_map
@@ -242,7 +257,7 @@ def fetch_species_map(supabase: Client) -> dict:
 # ------------------------------------------------------------------------------
 def main():
     # Read from env
-    BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
+    BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "my-default-bucket-name")
     if not BUCKET_NAME:
         raise ValueError("Please set GCS_BUCKET_NAME in environment.")
 
