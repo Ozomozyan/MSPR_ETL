@@ -257,7 +257,7 @@ def fetch_species_map(supabase: Client) -> dict:
 # ------------------------------------------------------------------------------
 def main():
     # Read from env
-    BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "my-default-bucket-name")
+    BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
     if not BUCKET_NAME:
         raise ValueError("Please set GCS_BUCKET_NAME in environment.")
 
