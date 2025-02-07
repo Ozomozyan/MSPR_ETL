@@ -1,0 +1,11 @@
+google-cloud-storage==2.9.0
+# or google-cloud-storage >= whatever version
+# plus any image-processing library you want, e.g. pillow or opencv
+Pillow==9.1.0
+opencv-python==4.5.5.62
+
+# For Supabase
+supabase==0.1.0  # or whichever library you choose to use
+
+# For Python .env handling if needed
+python-dotenv==0.21.0

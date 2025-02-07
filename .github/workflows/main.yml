@@ -1,0 +1,42 @@
+name: ETL Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure GCP Credentials
+        run: |
+          echo "${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}" > gcp_creds.json
+          echo "Created local gcp_creds.json"
+        shell: bash
+
+      - name: Set GOOGLE_APPLICATION_CREDENTIALS
+        run: |
+          echo "Setting env var for GCP credentials"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=gcp_creds.json" >> $GITHUB_ENV
+
+      - name: Run ETL script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python etl/main.py
