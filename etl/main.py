@@ -19,7 +19,7 @@ This script demonstrates an end-to-end ETL pipeline that:
 Environment Variables:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
-- GOOGLE_APPLICATION_CREDENTIALS (file path to your GCP service account JSON)
+- GOOGLE_APPLICATION_CREDENTIALS (file path to your service account JSON)
 
 Additional assumptions:
 - The table "infos_especes" has an auto-increment primary key (id) and columns like:
@@ -27,12 +27,12 @@ Additional assumptions:
 - The table "footprint_images" has columns:
     id (pk), species_id (fk to infos_especes.id), image_name (string), image_url (string)
 - This script relies on the supabase-py client, google-cloud-storage, pandas (for xlsx->csv), Pillow, etc.
-
 """
 
 import os
 import hashlib
 import pandas as pd
+import numpy as np
 import tempfile
 import re
 
@@ -43,7 +43,6 @@ from supabase import create_client, Client
 # ------------------------------------------------------------------------------
 # 1. CONNECT TO SUPABASE
 # ------------------------------------------------------------------------------
-
 def get_supabase_client() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -54,7 +53,6 @@ def get_supabase_client() -> Client:
 # ------------------------------------------------------------------------------
 # 2. CONNECT TO GOOGLE CLOUD STORAGE
 # ------------------------------------------------------------------------------
-
 def get_gcs_client() -> storage.Client:
     # Make sure GOOGLE_APPLICATION_CREDENTIALS is set to the path of your service account JSON
     return storage.Client()
@@ -62,7 +60,6 @@ def get_gcs_client() -> storage.Client:
 # ------------------------------------------------------------------------------
 # 3. CHECK AND FILL infos_especes TABLE
 # ------------------------------------------------------------------------------
-
 def ensure_infos_especes_filled(
     supabase: Client,
     bucket_name: str,
@@ -92,22 +89,25 @@ def ensure_infos_especes_filled(
         blob.download_to_filename(local_xlsx_path)
         print("Downloaded infos_especes.xlsx")
 
-        # 3.3 Convert xlsx to CSV (optional). We'll just read xlsx directly via pandas.
+        # 3.3 Read xlsx into pandas
         df = pd.read_excel(local_xlsx_path)
 
-        # Expect columns like ["Espece", "Description"] or similar.
-        # Let's rename them if needed.
-        # E.g. if your columns are "Espèce" in the XLSX, rename:
+        # Handle infinite values by converting them to NaN,
+        # then fill all NaN with None so the JSON payload is valid
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.fillna(value=None, inplace=True)
+
+        # Let's rename columns if needed (replace spaces with underscores).
         rename_map = {}
         for col in df.columns:
-            clean_col = re.sub(r"\s+", "_", col.strip())  # replace whitespace with underscores
+            clean_col = re.sub(r"\\s+", "_", col.strip())  # replace whitespace with underscores
             rename_map[col] = clean_col
         df.rename(columns=rename_map, inplace=True)
 
-        # At minimum, we expect df["Espece"] and df["Description"] or similar.
-        # Insert each row into supabase.
+        # Convert to list of dicts
         records = df.to_dict(orient="records")
-        # Insert in batches or all at once.
+
+        # Insert data in batches
         chunk_size = 500
         for i in range(0, len(records), chunk_size):
             batch = records[i:i+chunk_size]
@@ -118,7 +118,6 @@ def ensure_infos_especes_filled(
 # ------------------------------------------------------------------------------
 # 4. PROCESS IMAGES (CHECK DUPLICATES, CORRUPTION, ETC.)
 # ------------------------------------------------------------------------------
-
 def process_images(
     supabase: Client,
     bucket_name: str,
@@ -137,7 +136,6 @@ def process_images(
 
     # 4.2 List all blobs in raw_folder_prefix (e.g. Mammifères/<SpeciesName>/...)
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
-    # We'll store tuples of (blob_name, species_dir, image_filename)
     image_candidates = []
     for blob in raw_blobs:
         # Skip directories
@@ -146,43 +144,43 @@ def process_images(
         # example: Mammifères/Hippopotame/img123.jpg
         path_parts = blob.name.split('/')
         if len(path_parts) < 3:
-            # e.g. something like Mammifères/ plus a filename is 2 parts, meaning no species subfolder
+            # e.g. Mammifères/ + filename => 2 parts, no species subfolder
             print(f"Skipping {blob.name}, no subfolder structure.")
             continue
-        # path_parts[1] is the species folder, path_parts[-1] is the file name
         species_name = path_parts[1]
         image_filename = path_parts[-1]
         image_candidates.append((blob.name, species_name, image_filename))
 
-    # 4.3 Create local temp folder
+    # 4.3 Create local temp folders
     local_temp_raw = tempfile.mkdtemp(prefix="raw_images_")
     local_temp_processed = tempfile.mkdtemp(prefix="processed_images_")
 
     # 4.4 Hash set to detect duplicates
     seen_hashes = set()
 
-    # We'll keep track of valid images to eventually re-upload.
+    # Keep track of valid images to re-upload
     images_to_upload = []  # list of (local_path, species_name, new_filename)
 
     for blob_name, species_name, image_filename in image_candidates:
-        # If we don't have a row in infos_especes for that species, skip.
+        # If there's no matching species, skip
         if species_name not in species_map:
             print(f"Species '{species_name}' not found in infos_especes. Skipping {blob_name}.")
             continue
+
         # Download the image locally
         local_download_path = os.path.join(local_temp_raw, image_filename)
         blob = bucket.blob(blob_name)
         blob.download_to_filename(local_download_path)
 
-        # Check for corruption
+        # Check corruption
         try:
             with Image.open(local_download_path) as img:
-                img.verify()  # verify no corruption
+                img.verify()
         except Exception as e:
             print(f"Corrupt image detected. Skipping {blob_name}. Error: {e}")
             continue
 
-        # Check for duplicates via md5 hash
+        # Check duplicates via md5
         filehash = hashlib.md5(open(local_download_path, 'rb').read()).hexdigest()
         if filehash in seen_hashes:
             print(f"Duplicate image detected. Skipping {blob_name}.")
@@ -190,31 +188,28 @@ def process_images(
         else:
             seen_hashes.add(filehash)
 
-        # If valid and unique, do your processing (resize, etc.)
-        processed_filename = image_filename  # or you can rename it
+        # If valid and unique, do processing (resize, etc.)
+        processed_filename = image_filename
         local_processed_path = os.path.join(local_temp_processed, processed_filename)
         try:
             with Image.open(local_download_path) as img:
-                # resize to 128x128
+                # Example resize to 128x128
                 img_resized = img.resize((128, 128))
                 img_resized.save(local_processed_path)
         except Exception as e:
             print(f"Error resizing image {blob_name}: {e}")
             continue
 
-        # Keep track for upload
         images_to_upload.append((local_processed_path, species_name, processed_filename))
 
-    # 4.5 Upload processed images to processed_folder_prefix
-    # Then insert references into footprint_images.
+    # 4.5 Upload processed images and insert references into footprint_images
     for local_path, species_name, processed_filename in images_to_upload:
         new_blob_path = f"{processed_folder_prefix}{species_name}/{processed_filename}"
         new_blob = bucket.blob(new_blob_path)
         new_blob.upload_from_filename(local_path)
-        new_blob.make_public()  # or handle ACL as needed
+        # Optionally make public
+        new_blob.make_public()
 
-        # Insert record in footprint_images table
-        # species_map[species_name] is the id from infos_especes
         record = {
             "species_id": species_map[species_name],
             "image_name": processed_filename,
@@ -227,7 +222,6 @@ def process_images(
 # ------------------------------------------------------------------------------
 # 5. FETCH SPECIES MAP (species_name -> id)
 # ------------------------------------------------------------------------------
-
 def fetch_species_map(supabase: Client) -> dict:
     """
     Returns a dictionary mapping the infos_especes.Espece to its id.
@@ -244,7 +238,6 @@ def fetch_species_map(supabase: Client) -> dict:
 # ------------------------------------------------------------------------------
 # 6. MAIN
 # ------------------------------------------------------------------------------
-
 def main():
     # Read from env
     BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
