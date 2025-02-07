@@ -25,7 +25,7 @@ jobs:
 
       - name: Configure GCP Credentials
         run: |
-          printf '%s' "${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}" > gcp_creds.json
+          echo "${{ secrets.GCP_SERVICE_ACCOUNT_JSON_B64 }}" | base64 -d > gcp_creds.json
           echo "Created local gcp_creds.json"
         shell: bash
 
