@@ -210,7 +210,7 @@ def process_images(
         new_blob = bucket.blob(new_blob_path)
         new_blob.upload_from_filename(local_path)
         # Optionally make public
-        new_blob.make_public()
+        #new_blob.make_public()
 
         record = {
             "species_id": species_map[species_name],
