@@ -1,181 +1,101 @@
 #!/usr/bin/env python3
 
 import os
-import hashlib
-import pandas as pd
-import numpy as np
 import tempfile
-import re
-
-from PIL import Image
 from google.cloud import storage
-from supabase import create_client, Client
+from PIL import Image
 
-def get_supabase_client() -> Client:
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key:
-        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.")
-    return create_client(url, key)
-
-def get_gcs_client() -> storage.Client:
+def get_gcs_client():
+    """Return a Google Cloud Storage client using default credentials."""
+    # Ensure GOOGLE_APPLICATION_CREDENTIALS is set
     return storage.Client()
-
-def ensure_infos_especes_filled(
-    supabase: Client,
-    bucket_name: str,
-    xlsx_blob_name: str = "infos_especes.xlsx",
-) -> None:
-    # (You can leave this logic as is or skip it—no changes needed for your test.)
-    response = supabase.table("infos_especes").select("id").execute()
-    if len(response.data) > 0:
-        print("infos_especes table is not empty. Skipping fill.")
-        return
-    print("infos_especes table is empty. Proceeding to fill from GCS xlsx.")
-    gcs_client = get_gcs_client()
-    bucket = gcs_client.bucket(bucket_name)
-    blob = bucket.blob(xlsx_blob_name)
-    if not blob.exists():
-        raise FileNotFoundError(f"Could not find {xlsx_blob_name} in bucket {bucket_name}.")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_xlsx_path = os.path.join(tmpdir, xlsx_blob_name)
-        blob.download_to_filename(local_xlsx_path)
-        print("Downloaded infos_especes.xlsx")
-        df = pd.read_excel(local_xlsx_path)
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df = df.where(df.notnull(), None)
-        rename_map = {}
-        for col in df.columns:
-            clean_col = re.sub(r"\\s+", "_", col.strip())
-            rename_map[col] = clean_col
-        df.rename(columns=rename_map, inplace=True)
-        records = df.to_dict(orient="records")
-        chunk_size = 500
-        for i in range(0, len(records), chunk_size):
-            batch = records[i : i + chunk_size]
-            supabase.table("infos_especes").insert(batch).execute()
-        print("Inserted records into infos_especes.")
-
-def process_images_no_db_check(
-    bucket_name: str,
-    raw_folder_prefix: str = "Mammifères/",
-    processed_folder_prefix: str = "processed_data/"
-):
-    """
-    A simplified version that:
-      - Lists everything in raw_folder_prefix
-      - Ignores supabase species checks
-      - Resizes & reuploads images
-      - DOES NOT insert into footprint_images
-    """
-    print(f"DEBUG: Starting simplified image processing. raw='{raw_folder_prefix}', processed='{processed_folder_prefix}'")
-    gcs_client = get_gcs_client()
-    bucket = gcs_client.bucket(bucket_name)
-
-    raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
-    image_candidates = []
-
-    print("DEBUG: Enumerating objects in bucket with prefix:", raw_folder_prefix)
-    for blob in raw_blobs:
-        print(f"DEBUG: Found object in GCS -> {blob.name}")
-
-        # Skip directories (any name ending with '/')
-        if blob.name.endswith("/"):
-            print(f"DEBUG: Skipping '{blob.name}' - directory placeholder.")
-            continue
-
-        path_parts = blob.name.split('/')
-        if len(path_parts) < 3:
-            print(f"DEBUG: Skipping {blob.name}, no subfolder structure.")
-            continue
-
-        # We'll just accept the species_name even if not in DB
-        species_name = path_parts[1]
-        image_filename = path_parts[-1]
-        print(f"DEBUG: -> species='{species_name}', filename='{image_filename}'")
-
-        image_candidates.append((blob.name, species_name, image_filename))
-
-    local_temp_raw = tempfile.mkdtemp(prefix="raw_images_")
-    local_temp_processed = tempfile.mkdtemp(prefix="processed_images_")
-    print(f"DEBUG: Temp folders: raw='{local_temp_raw}', processed='{local_temp_processed}'")
-
-    seen_hashes = set()
-    images_to_upload = []
-
-    # Download, check corruption, check duplicates, resize
-    for blob_name, species_name, image_filename in image_candidates:
-        print(f"\nDEBUG: Processing '{blob_name}' -> species='{species_name}', file='{image_filename}'")
-        local_download_path = os.path.join(local_temp_raw, image_filename)
-
-        # Download
-        blob = bucket.blob(blob_name)
-        blob.download_to_filename(local_download_path)
-        print(f"DEBUG: Downloaded to {local_download_path}")
-
-        # Check corruption
-        try:
-            with Image.open(local_download_path) as img:
-                img.verify()
-            print("DEBUG: Verified OK.")
-        except Exception as e:
-            print(f"WARNING: Corrupt image. Skipping {blob_name}. Error: {e}")
-            continue
-
-        # Check duplicates
-        filehash = hashlib.md5(open(local_download_path, 'rb').read()).hexdigest()
-        if filehash in seen_hashes:
-            print(f"WARNING: Duplicate image. Skipping {blob_name}.")
-            continue
-        seen_hashes.add(filehash)
-        print(f"DEBUG: Unique hash={filehash}")
-
-        # Resize
-        processed_filename = image_filename
-        local_processed_path = os.path.join(local_temp_processed, processed_filename)
-        try:
-            with Image.open(local_download_path) as img:
-                img_resized = img.resize((128, 128))
-                img_resized.save(local_processed_path)
-            print(f"DEBUG: Resized -> {local_processed_path}")
-        except Exception as e:
-            print(f"WARNING: Error resizing image {blob_name}: {e}")
-            continue
-
-        images_to_upload.append((local_processed_path, species_name, processed_filename))
-
-    # Upload to 'processed_data/<species>/filename'
-    print("\nDEBUG: Uploading processed images (no DB insert) ...")
-    for local_path, species_name, processed_filename in images_to_upload:
-        new_blob_path = f"{processed_folder_prefix}{species_name}/{processed_filename}"
-        print(f"DEBUG: Uploading {local_path} to {new_blob_path}")
-        new_blob = bucket.blob(new_blob_path)
-        new_blob.upload_from_filename(local_path)
-        new_blob.make_public()
-        print(f"DEBUG: Done. Public URL: {new_blob.public_url}")
-
-    print("\nSimplified image processing complete.")
 
 def main():
     BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
-    if not BUCKET_NAME:
-        raise ValueError("Please set GCS_BUCKET_NAME in environment.")
+    print(f"Using bucket: {BUCKET_NAME}")
+    
+    client = get_gcs_client()
+    bucket = client.bucket(BUCKET_NAME)
 
-    supabase = get_supabase_client()
+    print("\n--- PHASE 1: List all possible 'directories' in top level ---")
+    # We will do this by listing blobs with a delimiter
+    # That allows us to see 'prefixes' which GCS interprets like directories.
+    top_level_blobs = client.list_blobs(bucket_or_name=BUCKET_NAME, delimiter='/')
+    # Access the 'prefixes' attribute from the iterator to see subdirectories
+    prefixes = top_level_blobs.prefixes
+    if not prefixes:
+        print("No subdirectories found at top level.")
+    else:
+        for prefix in prefixes:
+            print(f"Found directory-like prefix: {prefix}")
 
-    # 1. Optionally fill infos_especes (can keep or skip)
-    ensure_infos_especes_filled(
-        supabase=supabase,
-        bucket_name=BUCKET_NAME,
-        xlsx_blob_name="infos_especes.xlsx"
-    )
+    # For a more detailed approach, you can re-run list_blobs with prefix and delimiter.
+    print("\n--- PHASE 2: For each top-level prefix, list its subcontents ---")
+    if not prefixes:
+        print("No directories to explore further.")
+    else:
+        for prefix in prefixes:
+            print(f"\nExploring prefix: {prefix}")
+            # list_blobs with prefix=prefix, delimiter='/' to see nested objects
+            sub_blob_iterator = client.list_blobs(BUCKET_NAME, prefix=prefix, delimiter='/')
+            # sub_blob_iterator will return all objects under that prefix
+            # but not deeper "directories" if delimiter is set.
+            
+            # Print subdirectories within this prefix
+            sub_prefixes = sub_blob_iterator.prefixes
+            if sub_prefixes:
+                print(f"  Subdirectories of {prefix}:")
+                for sp in sub_prefixes:
+                    print(f"    {sp}")
+            else:
+                print(f"  No nested subdirectories under {prefix}")
 
-    # 2. Use the no-DB-check version to confirm we see images
-    process_images_no_db_check(
-        bucket_name=BUCKET_NAME,
-        raw_folder_prefix="Mammifères/",
-        processed_folder_prefix="processed_data/"
-    )
+            # Print actual objects (files) in this prefix
+            found_any_file = False
+            for blob in sub_blob_iterator:
+                found_any_file = True
+                print(f"  File: {blob.name} (size={blob.size} bytes)")
+            if not found_any_file:
+                print(f"  No direct files in {prefix}")
 
-if __name__ == "__main__":
+    # Example: If you specifically want to test the `Mammifères/` folder
+    # we can do a direct listing of everything under that prefix:
+    print("\n--- PHASE 3: List everything under 'Mammifères/' ---")
+    mammals_prefix = "Mammifères/"
+    mammif_blobs = client.list_blobs(BUCKET_NAME, prefix=mammals_prefix)
+    
+    found_files = []
+    for blob in mammif_blobs:
+        print(f"Found object: {blob.name}")
+        # If it doesn't end with '/', consider it a file
+        if not blob.name.endswith("/"):
+            found_files.append(blob)
+
+    # If you want to process these files, for example:
+    print("\n--- PHASE 4: Download & test process each image file ---")
+    if not found_files:
+        print("No files found under Mammifères/. Exiting early.")
+        return
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for blob in found_files:
+            local_path = os.path.join(temp_dir, os.path.basename(blob.name))
+            print(f"Downloading {blob.name} to {local_path}")
+            blob.download_to_filename(local_path)
+
+            # Try to open & resize
+            try:
+                with Image.open(local_path) as img:
+                    print(f"  {blob.name} opened successfully, size={img.size}")
+                    resized = img.resize((128, 128))
+                    # e.g. save locally, or do further checks
+                    resized_path = os.path.join(temp_dir, "resized_" + os.path.basename(blob.name))
+                    resized.save(resized_path)
+                    print(f"  Resized and saved to {resized_path}")
+            except Exception as e:
+                print(f"  ERROR: Could not process {blob.name}: {e}")
+
+    print("\nAll done. Check logs above to see which directories/files were found and processed.")
+
+if __name__ == '__main__':
     main()
