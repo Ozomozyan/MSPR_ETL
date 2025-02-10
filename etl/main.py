@@ -123,8 +123,8 @@ def ensure_infos_especes_filled(
 def process_images(
     supabase: Client,
     bucket_name: str,
-    raw_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/Mammifères",
-    processed_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/processed_data"
+    raw_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/Mammifères/",
+    processed_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/processed_data/"
 ):
     """
     Download images from GCS, remove duplicates/corrupted, resize, re-upload to processed_data.
@@ -260,8 +260,8 @@ def main():
     process_images(
         supabase=supabase,
         bucket_name=BUCKET_NAME,
-        raw_folder_prefix="bucket-mspr_epsi-vine-449913-f6/Mammifères",
-        processed_folder_prefix="bucket-mspr_epsi-vine-449913-f6/processed_data"
+        raw_folder_prefix="bucket-mspr_epsi-vine-449913-f6/Mammifères/",
+        processed_folder_prefix="bucket-mspr_epsi-vine-449913-f6/processed_data/"
     )
 
 if __name__ == "__main__":
