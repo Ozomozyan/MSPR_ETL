@@ -123,8 +123,8 @@ def ensure_infos_especes_filled(
 def process_images(
     supabase: Client,
     bucket_name: str,
-    raw_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/Mammifères/",
-    processed_folder_prefix: str = "bucket-mspr_epsi-vine-449913-f6/processed_data/"
+    raw_folder_prefix: str = "Mammifères/",
+    processed_folder_prefix: str = "processed_data/"
 ):
     """
     Download images from GCS, remove duplicates/corrupted, resize, re-upload to processed_data.
@@ -241,27 +241,25 @@ def fetch_species_map(supabase: Client) -> dict:
 # 6. MAIN
 # ------------------------------------------------------------------------------
 def main():
-    # Read from env
+    # Replace these with the exact spellings/characters
     BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
     if not BUCKET_NAME:
         raise ValueError("Please set GCS_BUCKET_NAME in environment.")
 
-    # 6.1 Connect to Supabase
     supabase = get_supabase_client()
 
-    # 6.2 Ensure infos_especes is filled
     ensure_infos_especes_filled(
         supabase=supabase,
         bucket_name=BUCKET_NAME,
         xlsx_blob_name="infos_especes.xlsx"
     )
 
-    # 6.3 Process images (duplicates, corruption, etc.) and fill footprint_images
+    # IMPORTANT: Use the EXACT prefix found in GCS.
     process_images(
         supabase=supabase,
         bucket_name=BUCKET_NAME,
-        raw_folder_prefix="bucket-mspr_epsi-vine-449913-f6/Mammifères/",
-        processed_folder_prefix="bucket-mspr_epsi-vine-449913-f6/processed_data/"
+        raw_folder_prefix="Mammifères/",      # with correct accent
+        processed_folder_prefix="processed_data/"
     )
 
 if __name__ == "__main__":
