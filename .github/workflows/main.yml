@@ -1,17 +1,14 @@
-name: ETL Pipeline
-
+name: Test GCS
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+  push:
+    branches: ["main"]
 
 jobs:
-  run-etl:
+  test-gcs-job:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -21,22 +18,20 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pillow google-cloud-storage
 
-      - name: Configure GCP Credentials
+      - name: Configure GCP credentials
         run: |
-          echo "${{ secrets.GCP_SERVICE_ACCOUNT_JSON_B64 }}" | base64 -d > gcp_creds.json
+          echo "${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}" > gcp_creds.json
           echo "Created local gcp_creds.json"
         shell: bash
 
       - name: Set GOOGLE_APPLICATION_CREDENTIALS
         run: |
-          echo "Setting env var for GCP credentials"
           echo "GOOGLE_APPLICATION_CREDENTIALS=gcp_creds.json" >> $GITHUB_ENV
 
-      - name: Run ETL script
+      - name: Run GCS listing script
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
         run: |
-          python etl/main.py
+          python etl/test_gcs.py
