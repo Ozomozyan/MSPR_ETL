@@ -67,9 +67,13 @@ def ensure_infos_especes_filled(
 ) -> None:
     """
     Checks if infos_especes table is empty in Supabase.
-    If empty, fetches the xlsx from GCS, optionally converts to CSV, then inserts data.
+    If empty, fetches the main infos_especes.xlsx from GCS.
+    Then uses fallback column files (espece.xlsx, description.xlsx, etc.)
+    to fill missing cells in the main DataFrame.
+    Finally, inserts the resulting data into the infos_especes table.
     """
-    # 3.1 Check if infos_especes is empty
+
+    # 1) Check if infos_especes is empty
     response = supabase.table("infos_especes").select("id").execute()
     if len(response.data) > 0:
         print("infos_especes table is not empty. Skipping fill.")
@@ -77,45 +81,79 @@ def ensure_infos_especes_filled(
 
     print("infos_especes table is empty. Proceeding to fill from GCS xlsx.")
 
-    # 3.2 Download xlsx from GCS
+    # 2) Download the main XLSX from GCS
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
-    blob = bucket.blob(xlsx_blob_name)
-    if not blob.exists():
+    blob_main = bucket.blob(xlsx_blob_name)
+    if not blob_main.exists():
         raise FileNotFoundError(f"Could not find {xlsx_blob_name} in bucket {bucket_name}.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_xlsx_path = os.path.join(tmpdir, xlsx_blob_name)
-        blob.download_to_filename(local_xlsx_path)
-        print("Downloaded infos_especes.xlsx")
+        # Download main file
+        local_main_path = os.path.join(tmpdir, xlsx_blob_name)
+        blob_main.download_to_filename(local_main_path)
+        print(f"Downloaded main file: {xlsx_blob_name}")
 
-        # 3.3 Read xlsx into pandas
-        df = pd.read_excel(local_xlsx_path)
+        # Read main DataFrame
+        df_main = pd.read_excel(local_main_path)
 
-        # Handle infinite values by converting them to NaN.
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # 3) For each fallback column file, read it and fill missing cells in df_main
+        # We'll do them in a list of (blob_name, column_name):
+        fallback_files = [
+            ("espece.xlsx", "Espèce"),
+            ("description.xlsx", "Description"),
+            ("nom_latin.xlsx", "Nom latin"),
+            ("famille.xlsx", "Famille"),
+            ("taille.xlsx", "Taille"),
+            ("region.xlsx", "Région"),
+            ("habitat.xlsx", "Habitat"),
+            ("fun_fact.xlsx", "Fun fact"),
+        ]
 
-        # Instead of fillna(value=None), we'll convert NaN -> None using 'where' so that JSON is valid.
-        # This approach ensures that nulls become Python None, which supabase-py can serialize as JSON null.
-        df = df.where(df.notnull(), None)
+        for fallback_blob_name, col_name in fallback_files:
+            fallback_blob = bucket.blob(fallback_blob_name)
+            if fallback_blob.exists():
+                local_fallback_path = os.path.join(tmpdir, fallback_blob_name)
+                fallback_blob.download_to_filename(local_fallback_path)
+                print(f"Downloaded fallback file: {fallback_blob_name}")
 
-        # Let's rename columns if needed (replace spaces with underscores).
+                # read fallback data
+                df_fallback = pd.read_excel(local_fallback_path)
+
+                # Check that df_fallback has the column we need
+                if col_name not in df_fallback.columns:
+                    print(f"Warning: {fallback_blob_name} does not contain column '{col_name}'. Skipping.")
+                    continue
+
+                # We'll assume same row alignment. So row i in df_main aligns with row i in df_fallback
+                # If df_main has fewer/more rows, watch out for out-of-bounds indexing
+                min_rows = min(len(df_main), len(df_fallback))
+                for i in range(min_rows):
+                    # If df_main at row i is missing, fill from fallback
+                    if pd.isnull(df_main.loc[i, col_name]):
+                        df_main.loc[i, col_name] = df_fallback.loc[i, col_name]
+            else:
+                print(f"Fallback file {fallback_blob_name} not found. Skipping fallback for {col_name}.")
+
+        # 4) Convert inf -> nan, then nan -> None
+        df_main.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df_main = df_main.where(df_main.notnull(), None)
+
+        # 5) Rename columns if needed
         rename_map = {}
-        for col in df.columns:
-            clean_col = re.sub(r"\\s+", "_", col.strip())  # replace whitespace with underscores
+        for col in df_main.columns:
+            clean_col = re.sub(r"\\s+", "_", col.strip())  # replace whitespace
             rename_map[col] = clean_col
-        df.rename(columns=rename_map, inplace=True)
+        df_main.rename(columns=rename_map, inplace=True)
 
-        # Convert to list of dicts
-        records = df.to_dict(orient="records")
-
-        # Insert data in batches
+        # 6) Insert into supabase in chunks
+        records = df_main.to_dict(orient="records")
         chunk_size = 500
         for i in range(0, len(records), chunk_size):
             batch = records[i:i+chunk_size]
             supabase.table("infos_especes").insert(batch).execute()
 
-        print("Inserted records into infos_especes.")
+        print("Inserted records into infos_especes after fallback merges.")
 
 # ------------------------------------------------------------------------------
 # 4. PROCESS IMAGES (CHECK DUPLICATES, CORRUPTION, ETC.)
@@ -247,6 +285,11 @@ def main():
         raise ValueError("Please set GCS_BUCKET_NAME in environment.")
 
     supabase = get_supabase_client()
+    
+    # 2. Reset your tables by calling the RPC
+    print("Resetting tables via 'reset_my_tables' RPC...")
+    supabase.rpc("reset_my_tables").execute()
+    print("Tables truncated and sequences reset to 1.")
 
     ensure_infos_especes_filled(
         supabase=supabase,
