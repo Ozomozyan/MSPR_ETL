@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
 """
-ETL pipeline script that:
-1. Optionally resets tables if they're both empty.
-2. Fills infos_especes from an XLSX (merging fallback column files).
-3. Processes images (duplicates/corruption checks), inserts them in footprint_images.
-4. Performs data quality checks and logs them to data_quality_logs.
+ETL pipeline script for:
+1. Filling `infos_especes` table if empty (or merging fallback columns if partial).
+2. Processing images in Google Cloud Storage under "Mammifères/<SpeciesName>/..."
+   -> duplication/corruption checks, resizing, and storing references in `footprint_images`.
 
-Now includes a simple database check to avoid re-inserting images across multiple runs.
+Only resets tables (truncate + restart identity) if *both* tables are completely empty.
 """
 
 import os
@@ -16,15 +15,14 @@ import pandas as pd
 import numpy as np
 import tempfile
 import re
-from datetime import datetime
 
 from PIL import Image
 from google.cloud import storage
 from supabase import create_client, Client
 
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # 1. CONNECT TO SUPABASE
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 def get_supabase_client() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -32,22 +30,25 @@ def get_supabase_client() -> Client:
         raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.")
     return create_client(url, key)
 
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # 2. CONNECT TO GOOGLE CLOUD STORAGE
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 def get_gcs_client() -> storage.Client:
     # Make sure GOOGLE_APPLICATION_CREDENTIALS is set to the path of your service account JSON
     return storage.Client()
 
-# ------------------------------------------------------------------------------
-# 3. MAYBE RESET TABLES (truncate + restart identity if BOTH are empty)
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 3. CHECK IF WE NEED TO RESET TABLES (truncate + restart identity)
+# -------------------------------------------------------------------------
 def maybe_reset_tables(supabase: Client):
     """
     Calls reset_my_tables() if and only if both infos_especes AND footprint_images
-    are completely empty. If either has data, skip reset so we won't overwrite partial data.
+    are completely empty. If either has data, we skip the reset so we won't overwrite
+    partially-filled data.
     """
+    # Check if infos_especes is empty
     r_especes = supabase.table("infos_especes").select("id").limit(1).execute()
+    # Check if footprint_images is empty
     r_images = supabase.table("footprint_images").select("id").limit(1).execute()
 
     count_especes = len(r_especes.data)
@@ -64,29 +65,35 @@ def maybe_reset_tables(supabase: Client):
             f"  footprint_images has {count_images} row(s)."
         )
 
-# ------------------------------------------------------------------------------
-# 4. FILL infos_especes (with fallback columns)
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 4. CHECK AND FILL infos_especes TABLE (merge fallback columns)
+# -------------------------------------------------------------------------
 def ensure_infos_especes_filled(
     supabase: Client,
     bucket_name: str,
     xlsx_blob_name: str = "infos_especes.xlsx",
 ) -> None:
     """
-    Checks if infos_especes table is empty. If empty, fetches the main infos_especes.xlsx.
-    Then uses fallback column files to fill missing cells. Finally, inserts data.
-    If table is partially filled, only inserts new species that aren't in DB yet.
+    Checks if infos_especes table is empty in Supabase.
+    If empty, fetches the main infos_especes.xlsx from GCS.
+    Then uses fallback column files (espece.xlsx, description.xlsx, etc.)
+    to fill missing cells in the main DataFrame.
+    Finally, inserts the resulting data into the infos_especes table.
     """
+    # 1) Check how many rows are in infos_especes
     response = supabase.table("infos_especes").select("*").execute()
     count_infos = len(response.data)
-    if count_infos > 0:
-        print(f"infos_especes already has {count_infos} row(s). Possibly partial fill.")
-    else:
-        print("infos_especes is empty. Filling from GCS xlsx.")
 
+    if count_infos > 0:
+        print(f"infos_especes table already has {count_infos} row(s). We can fill missing cells if needed.")
+    else:
+        print("infos_especes table is empty. Proceeding to fill from GCS xlsx.")
+
+    # Download the main file from GCS
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
     blob_main = bucket.blob(xlsx_blob_name)
+
     if not blob_main.exists():
         raise FileNotFoundError(f"Could not find {xlsx_blob_name} in bucket {bucket_name}.")
 
@@ -95,8 +102,10 @@ def ensure_infos_especes_filled(
         blob_main.download_to_filename(local_main_path)
         print(f"Downloaded main file: {xlsx_blob_name}")
 
+        # Read main DataFrame
         df_main = pd.read_excel(local_main_path)
 
+        # Fallback column files
         fallback_files = [
             ("espece.xlsx", "Espèce"),
             ("description.xlsx", "Description"),
@@ -107,16 +116,18 @@ def ensure_infos_especes_filled(
             ("habitat.xlsx", "Habitat"),
             ("fun_fact.xlsx", "Fun fact"),
         ]
+
+        # Merge missing cells from fallback DataFrames
         for fallback_blob_name, col_name in fallback_files:
             fallback_blob = bucket.blob(fallback_blob_name)
             if fallback_blob.exists():
                 local_fallback_path = os.path.join(tmpdir, fallback_blob_name)
                 fallback_blob.download_to_filename(local_fallback_path)
-                print(f"Downloaded fallback: {fallback_blob_name}")
+                print(f"Downloaded fallback file: {fallback_blob_name}")
 
                 df_fallback = pd.read_excel(local_fallback_path)
                 if col_name not in df_fallback.columns:
-                    print(f"Warning: {fallback_blob_name} lacks '{col_name}'. Skipping.")
+                    print(f"Warning: {fallback_blob_name} lacks column '{col_name}'. Skipping.")
                     continue
 
                 min_rows = min(len(df_main), len(df_fallback))
@@ -124,29 +135,37 @@ def ensure_infos_especes_filled(
                     if pd.isnull(df_main.loc[i, col_name]):
                         df_main.loc[i, col_name] = df_fallback.loc[i, col_name]
             else:
-                print(f"Fallback file {fallback_blob_name} not found. Skipping {col_name} fallback.")
+                print(f"Fallback file {fallback_blob_name} not found. Skipping fallback for {col_name}.")
 
-        # inf->nan, nan->None
+        # Convert inf -> nan, then nan -> None
         df_main.replace([np.inf, -np.inf], np.nan, inplace=True)
         df_main = df_main.where(df_main.notnull(), None)
 
+        # Rename columns if needed
         rename_map = {}
         for col in df_main.columns:
-            clean_col = re.sub(r"\\s+", "_", col.strip())
+            clean_col = re.sub(r"\\s+", "_", col.strip())  # e.g. "Espèce" -> "Espèce" or "Nom latin" -> "Nom_latin"
             rename_map[col] = clean_col
         df_main.rename(columns=rename_map, inplace=True)
+
+        # If the table is empty, we do a normal insert of all rows
+        # If the table is partially filled, you might want to update only missing rows.
+        # For simplicity, let's assume you want to insert everything new.
+        # (You could add logic to upsert by species name if you want partial fill.)
 
         records = df_main.to_dict(orient="records")
 
         if count_infos == 0:
-            # Table empty => insert all
-            print("Inserting all rows into infos_especes (table empty).")
+            # Insert all rows if table is empty
+            print("Inserting all rows into infos_especes because table was empty.")
             chunk_size = 500
             for i in range(0, len(records), chunk_size):
                 batch = records[i:i+chunk_size]
                 supabase.table("infos_especes").insert(batch).execute()
         else:
-            # Table partially filled => upsert new species only
+            # The table has partial data. We can do partial "upsert" if needed, or skip entirely.
+            # Here, we'll show an example of a naive approach:
+            # Insert any row that doesn't match existing "Espèce" name in the table
             existing_species = set()
             existing_query = supabase.table("infos_especes").select("Espèce").execute()
             for row in existing_query.data:
@@ -159,36 +178,17 @@ def ensure_infos_especes_filled(
                     new_records.append(rec)
 
             if new_records:
-                print(f"Inserting {len(new_records)} new row(s) into infos_especes.")
+                print(f"Inserting {len(new_records)} new record(s) for species not in DB.")
                 chunk_size = 500
                 for i in range(0, len(new_records), chunk_size):
                     batch = new_records[i:i+chunk_size]
                     supabase.table("infos_especes").insert(batch).execute()
             else:
-                print("No new species to add to infos_especes.")
+                print("No new species to add. Possibly fill missing columns via an UPDATE approach if needed.")
 
-# ------------------------------------------------------------------------------
-# 5. CHECK IF RECORD EXISTS (species_id + image_name)
-# ------------------------------------------------------------------------------
-### DUP CHECK ###
-def record_exists(supabase: Client, species_id: int, image_name: str) -> bool:
-    """
-    Returns True if footprint_images already has a row matching (species_id, image_name).
-    Otherwise False.
-    """
-    existing = (
-        supabase.table("footprint_images")
-        .select("id")
-        .eq("species_id", species_id)
-        .eq("image_name", image_name)
-        .maybe_single()
-        .execute()
-    )
-    return existing.data is not None
-
-# ------------------------------------------------------------------------------
-# 6. PROCESS IMAGES WITH CROSS-RUN DUPLICATE CHECK
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 5. PROCESS IMAGES (CHECK DUPLICATES, CORRUPTION, ETC.)
+# -------------------------------------------------------------------------
 def process_images(
     supabase: Client,
     bucket_name: str,
@@ -196,18 +196,20 @@ def process_images(
     processed_folder_prefix: str = "processed_data/"
 ):
     """
-    Download images from GCS, remove duplicates/corrupted, resize,
-    re-upload, then insert references. We skip insertion if the same
-    (species_id, image_name) is found in footprint_images from a previous run.
+    Download images from GCS, remove duplicates/corrupted, resize, re-upload to processed_data.
+    Then insert references in footprint_images table with the correct foreign key.
     """
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
 
+    # 5.1 Get existing species from infos_especes to map species name -> ID
     species_map = fetch_species_map(supabase)
 
+    # 5.2 List all blobs in raw_folder_prefix
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
     image_candidates = []
     for blob in raw_blobs:
+        # Skip directories (in GCS, these are just objects ending with "/")
         if blob.name.endswith("/"):
             continue
         path_parts = blob.name.split('/')
@@ -226,7 +228,7 @@ def process_images(
 
     for blob_name, species_name, image_filename in image_candidates:
         if species_name not in species_map:
-            print(f"Species '{species_name}' not in infos_especes. Skipping {blob_name}.")
+            print(f"Species '{species_name}' not found in infos_especes. Skipping {blob_name}.")
             continue
 
         local_download_path = os.path.join(local_temp_raw, image_filename)
@@ -238,18 +240,18 @@ def process_images(
             with Image.open(local_download_path) as img:
                 img.verify()
         except Exception as e:
-            print(f"Corrupt image. Skipping {blob_name}: {e}")
+            print(f"Corrupt image detected. Skipping {blob_name}. Error: {e}")
             continue
 
-        # Duplicate check in the same run (file hash)
+        # Check duplicates via MD5
         filehash = hashlib.md5(open(local_download_path, 'rb').read()).hexdigest()
         if filehash in seen_hashes:
-            print(f"Duplicate in this run => skipping {blob_name}.")
+            print(f"Duplicate image detected. Skipping {blob_name}.")
             continue
         else:
             seen_hashes.add(filehash)
 
-        # Resize
+        # Resize or other processing
         processed_filename = image_filename
         local_processed_path = os.path.join(local_temp_processed, processed_filename)
         try:
@@ -262,112 +264,41 @@ def process_images(
 
         images_to_upload.append((local_processed_path, species_name, processed_filename))
 
-    # Upload and insert references, skipping cross-run duplicates
+    # 5.3 Upload processed images and insert references
     for local_path, species_name, processed_filename in images_to_upload:
         new_blob_path = f"{processed_folder_prefix}{species_name}/{processed_filename}"
         new_blob = bucket.blob(new_blob_path)
         new_blob.upload_from_filename(local_path)
+        # optionally make_public if needed
+        # new_blob.make_public()
+
         record = {
             "species_id": species_map[species_name],
             "image_name": processed_filename,
-            "image_url": new_blob.public_url,
+            "image_url": new_blob.public_url,  # or handle if private
         }
-
-        ### DUP CHECK: CROSS-RUN DB CHECK ###
-        if record_exists(supabase, record["species_id"], record["image_name"]):
-            print(f"Skipping DB insert; already found species_id={record['species_id']}, image={record['image_name']}.")
-        else:
-            supabase.table("footprint_images").insert(record).execute()
-            print(f"Inserted => species_id={record['species_id']}, image={record['image_name']}")
+        supabase.table("footprint_images").insert(record).execute()
 
     print("Image processing and insertion complete.")
 
-# ------------------------------------------------------------------------------
-# 7. FETCH SPECIES MAP
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 6. FETCH SPECIES MAP (species_name -> id)
+# -------------------------------------------------------------------------
 def fetch_species_map(supabase: Client) -> dict:
     """
-    Map infos_especes.Espèce -> id
+    Returns a dictionary mapping the infos_especes.Espèce to its id.
     """
     data = supabase.table("infos_especes").select("id, Espèce").execute()
-    mapping = {}
+    species_map = {}
     for row in data.data:
         species_name = row.get("Espèce")
         species_id = row.get("id")
-        mapping[species_name] = species_id
-    return mapping
+        species_map[species_name] = species_id
+    return species_map
 
-# ------------------------------------------------------------------------------
-# 8. DATA QUALITY CHECKS
-# ------------------------------------------------------------------------------
-def record_data_quality_result(supabase: Client, table_name: str, test_vector, details: str = ""):
-    payload = {
-        "table_name": table_name,
-        "test_vector": test_vector,
-        "details": details,
-        "run_timestamp": datetime.utcnow().isoformat()
-    }
-    supabase.table("data_quality_logs").insert(payload).execute()
-
-def perform_data_quality_checks_for_infos_especes(supabase: Client):
-    exhaustiveness = 1
-    pertinence = 1
-    accuracy = 1
-    details_list = []
-
-    result = supabase.table("infos_especes").select("id, Espèce, Nom_latin").execute()
-    data = result.data
-    if len(data) < 13:
-        exhaustiveness = 0
-        details_list.append(f"Exhaustiveness: found {len(data)} rows, expected 13.")
-
-    for row in data:
-        espece = row.get("Espèce", "")
-        if not espece.strip():
-            pertinence = 0
-            details_list.append(f"Pertinence: row id={row['id']} has empty Espèce.")
-            break
-
-    for row in data:
-        nom_latin = row.get("Nom_latin", "")
-        if not nom_latin.strip():
-            accuracy = 0
-            details_list.append(f"Accuracy: row id={row['id']} has empty Nom_latin.")
-            break
-
-    return [exhaustiveness, pertinence, accuracy], "\n".join(details_list)
-
-def perform_data_quality_checks_for_footprint_images(supabase: Client):
-    exhaustiveness = 1
-    pertinence = 1
-    accuracy = 1
-    details_list = []
-
-    images_result = supabase.table("footprint_images").select("id, species_id, image_url").execute()
-    if len(images_result.data) == 0:
-        exhaustiveness = 0
-        details_list.append("Exhaustiveness: 0 rows in footprint_images.")
-
-    valid_ids_data = supabase.table("infos_especes").select("id").execute()
-    valid_ids = {row["id"] for row in valid_ids_data.data}
-    for row in images_result.data:
-        if row["species_id"] not in valid_ids:
-            pertinence = 0
-            details_list.append(f"Pertinence: row {row['id']} references invalid species_id {row['species_id']}.")
-            break
-
-    for row in images_result.data:
-        url = row.get("image_url", "")
-        if not url.startswith("http"):
-            accuracy = 0
-            details_list.append(f"Accuracy: row {row['id']} has invalid url '{url}'.")
-            break
-
-    return [exhaustiveness, pertinence, accuracy], "\n".join(details_list)
-
-# ------------------------------------------------------------------------------
-# 9. MAIN
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 7. MAIN
+# -------------------------------------------------------------------------
 def main():
     BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
     if not BUCKET_NAME:
@@ -375,18 +306,23 @@ def main():
 
     supabase = get_supabase_client()
 
+    # If both tables are empty, reset them (TRUNCATE + RESTART IDENTITY).
     maybe_reset_tables(supabase)
-    ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
-    process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
 
-    # Data quality checks
-    dq_infos_vector, dq_infos_details = perform_data_quality_checks_for_infos_especes(supabase)
-    record_data_quality_result(supabase, "infos_especes", dq_infos_vector, dq_infos_details)
-    print("Data quality (infos_especes) =>", dq_infos_vector, dq_infos_details)
+    # Fill or partially fill the infos_especes table
+    ensure_infos_especes_filled(
+        supabase=supabase,
+        bucket_name=BUCKET_NAME,
+        xlsx_blob_name="infos_especes.xlsx"
+    )
 
-    dq_foot_vector, dq_foot_details = perform_data_quality_checks_for_footprint_images(supabase)
-    record_data_quality_result(supabase, "footprint_images", dq_foot_vector, dq_foot_details)
-    print("Data quality (footprint_images) =>", dq_foot_vector, dq_foot_details)
+    # Process images
+    process_images(
+        supabase=supabase,
+        bucket_name=BUCKET_NAME,
+        raw_folder_prefix="Mammifères/",
+        processed_folder_prefix="processed_data/"
+    )
 
 if __name__ == "__main__":
     main()
