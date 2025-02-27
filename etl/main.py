@@ -5,9 +5,11 @@ ETL pipeline script for:
 1. Resetting tables if both are empty or whenever needed (TRUNCATE + RESTART IDENTITY).
 2. Filling `infos_especes` table if empty (or merging fallback columns if partial).
 3. Processing images in Google Cloud Storage under "Mammifères/<SpeciesName>/..."
-   -> duplication/corruption checks, resizing, and storing references in `footprint_images`.
-4. Running data quality tests on both tables (exhaustiveness, pertinence, accuracy).
-5. Logging the data quality results (including vectors and error descriptions) into data_quality_log table.
+   -> duplication/corruption checks, resizing, and storing/updating references in `footprint_images`.
+4. Running data quality tests on both tables (exhaustiveness, pertinence, accuracy) including
+   missing cells/rows checks and file extension checks for images.
+5. Logging the data quality results (including vectors and error descriptions) into data_quality_log table,
+   also logging if any ETL step fails.
 """
 
 import os
@@ -48,9 +50,7 @@ def maybe_reset_tables(supabase: Client):
     are completely empty. If either has data, we skip the reset so we won't overwrite
     partially-filled data.
     """
-    # Check if infos_especes is empty
     r_especes = supabase.table("infos_especes").select("id").limit(1).execute()
-    # Check if footprint_images is empty
     r_images = supabase.table("footprint_images").select("id").limit(1).execute()
 
     count_especes = len(r_especes.data)
@@ -58,8 +58,7 @@ def maybe_reset_tables(supabase: Client):
 
     if count_especes == 0 and count_images == 0:
         print("Both infos_especes and footprint_images are empty. Resetting tables...")
-        # This calls our DB RPC that truncates BOTH infos_especes and footprint_images
-        supabase.rpc("reset_my_tables").execute()
+        supabase.rpc("reset_my_tables").execute()  # Must truncate BOTH tables in your DB function
         print("Tables truncated and sequences reset to 1.")
     else:
         print(
@@ -69,7 +68,7 @@ def maybe_reset_tables(supabase: Client):
         )
 
 # -------------------------------------------------------------------------
-# 4. CHECK AND FILL infos_especes TABLE (merge fallback columns)
+# 4. CHECK AND FILL infos_especes TABLE (merge fallback columns, partial fill)
 # -------------------------------------------------------------------------
 def ensure_infos_especes_filled(
     supabase: Client,
@@ -81,18 +80,16 @@ def ensure_infos_especes_filled(
     If empty, fetches the main infos_especes.xlsx from GCS.
     Then uses fallback column files (espece.xlsx, description.xlsx, etc.)
     to fill missing cells in the main DataFrame.
-    Finally, inserts the resulting data into the infos_especes table.
+    Finally, inserts/upserts the resulting data into the infos_especes table.
     """
-    # 1) Check how many rows are in infos_especes
     response = supabase.table("infos_especes").select("*").execute()
     count_infos = len(response.data)
 
     if count_infos > 0:
-        print(f"infos_especes table already has {count_infos} row(s). We can fill missing cells if needed.")
+        print(f"infos_especes table already has {count_infos} row(s). We'll try to fill missing cells row by row.")
     else:
-        print("infos_especes table is empty. Proceeding to fill from GCS xlsx.")
+        print("infos_especes table is empty. We'll insert from the GCS xlsx.")
 
-    # Download the main file from GCS
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
     blob_main = bucket.blob(xlsx_blob_name)
@@ -105,10 +102,9 @@ def ensure_infos_especes_filled(
         blob_main.download_to_filename(local_main_path)
         print(f"Downloaded main file: {xlsx_blob_name}")
 
-        # Read main DataFrame
         df_main = pd.read_excel(local_main_path)
 
-        # Fallback column files
+        # fallback files
         fallback_files = [
             ("espece.xlsx", "Espèce"),
             ("description.xlsx", "Description"),
@@ -144,47 +140,58 @@ def ensure_infos_especes_filled(
         df_main.replace([np.inf, -np.inf], np.nan, inplace=True)
         df_main = df_main.where(df_main.notnull(), None)
 
-        # Rename columns if needed (for Supabase naming)
+        # Rename columns for Supabase naming (e.g. spaces -> underscores)
         rename_map = {}
         for col in df_main.columns:
             clean_col = re.sub(r"\s+", "_", col.strip())
             rename_map[col] = clean_col
         df_main.rename(columns=rename_map, inplace=True)
 
-        # Insert logic
         records = df_main.to_dict(orient="records")
 
         if count_infos == 0:
-            # Insert all rows if table is empty
+            # If table is empty, insert all rows
             print("Inserting all rows into infos_especes because table was empty.")
             chunk_size = 500
             for i in range(0, len(records), chunk_size):
-                batch = records[i:i+chunk_size]
+                batch = records[i : i + chunk_size]
                 supabase.table("infos_especes").insert(batch).execute()
         else:
-            # The table has partial data. We can do partial "upsert" if needed, or skip entirely.
-            existing_species = set()
-            existing_query = supabase.table("infos_especes").select("Espèce").execute()
-            for row in existing_query.data:
-                existing_species.add(row.get("Espèce"))
+            # If table is partially filled, do a naive row-by-row "upsert"
+            # We'll assume "Espèce" is a unique identifier. Adjust as needed.
+            existing_species_query = supabase.table("infos_especes").select("Espèce").execute()
+            existing_species_set = set(row.get("Espèce") for row in existing_species_query.data if row.get("Espèce"))
 
-            new_records = []
             for rec in records:
                 espece_name = rec.get("Espèce")
-                if espece_name not in existing_species:
-                    new_records.append(rec)
-
-            if new_records:
-                print(f"Inserting {len(new_records)} new record(s) for species not in DB.")
-                chunk_size = 500
-                for i in range(0, len(new_records), chunk_size):
-                    batch = new_records[i:i+chunk_size]
-                    supabase.table("infos_especes").insert(batch).execute()
-            else:
-                print("No new species to add. Possibly fill missing columns via an UPDATE approach if needed.")
+                # if not already in DB, insert
+                if espece_name not in existing_species_set:
+                    supabase.table("infos_especes").insert(rec).execute()
+                else:
+                    # if it's there, we do partial update on any columns that are None in DB
+                    # we'll fetch the current record, compare columns, fill missing
+                    current_data = (
+                        supabase.table("infos_especes")
+                        .select("*")
+                        .eq("Espèce", espece_name)
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if not current_data:
+                        # edge case: mismatch or concurrency
+                        continue
+                    current_record = current_data[0]
+                    update_dict = {}
+                    # For each column, if DB is None or empty, fill from rec
+                    for k, v in rec.items():
+                        if current_record.get(k) in [None, ""] and v not in [None, ""]:
+                            update_dict[k] = v
+                    if update_dict:
+                        supabase.table("infos_especes").update(update_dict).eq("Espèce", espece_name).execute()
 
 # -------------------------------------------------------------------------
-# 5. PROCESS IMAGES (CHECK DUPLICATES, CORRUPTION, ETC.)
+# 5. PROCESS IMAGES WITH PARTIAL "UPSERT" LOGIC
 # -------------------------------------------------------------------------
 def process_images(
     supabase: Client,
@@ -194,19 +201,20 @@ def process_images(
 ):
     """
     Download images from GCS, remove duplicates/corrupted, resize, re-upload to processed_data.
-    Then insert references in footprint_images table with the correct foreign key.
+    Then upsert references in footprint_images table with the correct foreign key.
+    - We now check if (species_id, image_name) exists; if so, we only fill missing columns.
     """
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
 
-    # 5.1 Get existing species from infos_especes to map species name -> ID
+    # 1. Build a species map from infos_especes
     species_map = fetch_species_map(supabase)
 
-    # 5.2 List all blobs in raw_folder_prefix
+    # 2. List all blobs in raw_folder_prefix
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
     image_candidates = []
     for blob in raw_blobs:
-        # Skip directories (in GCS, these are just objects ending with "/")
+        # Skip directories
         if blob.name.endswith("/"):
             continue
         path_parts = blob.name.split('/')
@@ -230,7 +238,13 @@ def process_images(
 
         local_download_path = os.path.join(local_temp_raw, image_filename)
         blob = bucket.blob(blob_name)
-        blob.download_to_filename(local_download_path)
+
+        # Attempt download
+        try:
+            blob.download_to_filename(local_download_path)
+        except Exception as e:
+            print(f"Failed downloading {blob_name}: {e}")
+            continue
 
         # Check corruption
         try:
@@ -248,11 +262,18 @@ def process_images(
         else:
             seen_hashes.add(filehash)
 
+        # File extension check (jpg, jpeg, png, etc.)
+        valid_extensions = (".jpg", ".jpeg", ".png")
+        if not image_filename.lower().endswith(valid_extensions):
+            print(f"Image {image_filename} does not have a valid extension. Skipping.")
+            continue
+
         # Resize or other processing
         processed_filename = image_filename
         local_processed_path = os.path.join(local_temp_processed, processed_filename)
         try:
             with Image.open(local_download_path) as img:
+                # Example: we do a basic 128x128 resize
                 img_resized = img.resize((128, 128))
                 img_resized.save(local_processed_path)
         except Exception as e:
@@ -261,22 +282,53 @@ def process_images(
 
         images_to_upload.append((local_processed_path, species_name, processed_filename))
 
-    # 5.3 Upload processed images and insert references
+    # 3. Upload processed images & upsert references in footprint_images
     for local_path, species_name, processed_filename in images_to_upload:
         new_blob_path = f"{processed_folder_prefix}{species_name}/{processed_filename}"
         new_blob = bucket.blob(new_blob_path)
-        new_blob.upload_from_filename(local_path)
-        # optionally make_public if needed
-        # new_blob.make_public()
 
+        try:
+            new_blob.upload_from_filename(local_path)
+        except Exception as e:
+            print(f"Error uploading {local_path} -> {new_blob_path}: {e}")
+            continue
+
+        # Record creation or update
         record = {
             "species_id": species_map[species_name],
             "image_name": processed_filename,
-            "image_url": new_blob.public_url,  # or handle if private
+            "image_url": new_blob.public_url,
+            # Could also add "image_type": "jpg" or something if you have a separate column
         }
-        supabase.table("footprint_images").insert(record).execute()
 
-    print("Image processing and insertion complete.")
+        # We'll check if this record (species_id, image_name) already exists
+        # If yes, update missing fields. If no, insert.
+        existing = (
+            supabase.table("footprint_images")
+            .select("*")
+            .eq("species_id", record["species_id"])
+            .eq("image_name", record["image_name"])
+            .execute()
+            .data
+        )
+        if existing:
+            # update missing columns
+            current_row = existing[0]
+            update_dict = {}
+            for k, v in record.items():
+                if current_row.get(k) in [None, ""] and v not in [None, ""]:
+                    update_dict[k] = v
+            if update_dict:
+                supabase.table("footprint_images") \
+                    .update(update_dict) \
+                    .eq("species_id", record["species_id"]) \
+                    .eq("image_name", record["image_name"]) \
+                    .execute()
+        else:
+            # Insert if not found
+            supabase.table("footprint_images").insert(record).execute()
+
+    print("Image processing and insertion/updating complete.")
 
 # -------------------------------------------------------------------------
 # 6. FETCH SPECIES MAP (species_name -> id)
@@ -300,38 +352,31 @@ def run_data_quality_checks_and_log(supabase: Client):
     """
     Runs data quality checks (exhaustiveness, pertinence, accuracy) for both
     'infos_especes' and 'footprint_images' and logs results in a data_quality_log table.
+    
+    We'll also check for missing columns/cells vs. the source data if we can reference them.
+    We'll log failures from the ETL process as well if desired (e.g., partial approach).
     """
-    # Step 1: Setup or assume data_quality_log table exists in Supabase
-    # (In practice, you'd create it via migrations. We'll assume it's there.)
-    # The table might have columns: execution_time, table_name, test_results (text), error_description (text)
-    # For example:
-    # CREATE TABLE IF NOT EXISTS data_quality_log (
-    #    id SERIAL PRIMARY KEY,
-    #    execution_time TIMESTAMP NOT NULL,
-    #    table_name TEXT NOT NULL,
-    #    test_results TEXT NOT NULL,
-    #    error_description TEXT
-    # );
-
     run_timestamp = datetime.datetime.utcnow().isoformat()
 
-    # We define some placeholders for expected data or constraints
-    expected_species_count = 13  # Example: If we expect ~100 species
+    # Example references
+    expected_species_count = 13
     allowed_species_categories = [
-    "Castor",
-    "Chat",
-    "Chien",
-    "Coyote",
-    "Ecureuil",
-    "Lapin",
-    "Loup",
-    "Lynx",
-    "Ours",
-    "Puma",
-    "Rat",
-    "Raton laveur",
-    "Renard"]
-    allowed_image_types = []  # If you have a column image_type, you'd define it. For now we'll skip.
+        "Castor",
+        "Chat",
+        "Chien",
+        "Coyote",
+        "Ecureuil",
+        "Lapin",
+        "Loup",
+        "Lynx",
+        "Ours",
+        "Puma",
+        "Rat",
+        "Raton laveur",
+        "Renard",
+    ]
+    # Check image files for valid extension. We'll do that in process_images, but you could do it here as well.
+    allowed_extensions = [".jpg", ".jpeg", ".png"]
 
     # We run checks on both tables
     tables_to_check = ["infos_especes", "footprint_images"]
@@ -340,10 +385,9 @@ def run_data_quality_checks_and_log(supabase: Client):
             supabase, tbl,
             expected_species_count,
             allowed_species_categories,
-            allowed_image_types
+            allowed_extensions
         )
 
-        # Convert results to string like "[1, 0, 2]"
         test_vector_str = str(results_vector)
         error_desc = "; ".join(errors) if errors else "No issues detected"
 
@@ -362,121 +406,117 @@ def run_quality_tests_for_table(
     table_name: str,
     expected_species_count: int,
     allowed_species_categories: list,
-    allowed_image_types: list
+    allowed_extensions: list
 ) -> (list, list):
     """
-    For a given table name, run our 3 tests:
+    For a given table name, run 3 tests:
       1) Exhaustiveness
       2) Pertinence
       3) Accuracy
-
-    Return (results_vector, errors_list):
-      - results_vector is something like [1, 0, 2]
-      - errors_list is a list of strings describing failures
+    We also add checks for missing cells if possible.
     """
-    # We'll store 3 test results (0/1/2)
-    # 0 = fail, 1 = pass, 2 = not applicable
-    results = [2, 2, 2]  # default them to 2, we'll override as needed
+    # 0=fail, 1=pass, 2=not applicable
+    results = [2, 2, 2]
     errors = []
 
-    # Common approach is to query the data from Supabase
-    # Then do the checks in Python. We'll do minimal examples below.
-
     if table_name == "infos_especes":
-        # Exhaustiveness test: compare row count to expected
-        r = supabase.table("infos_especes").select("id", count="exact").execute()
-        actual_count = r.count or len(r.data)  # r.count is available if we used count='exact'
+        # 1) Exhaustiveness: row count >= expected
+        resp = supabase.table("infos_especes").select("id", count="exact").execute()
+        actual_count = resp.count or len(resp.data)
         if actual_count < expected_species_count:
             results[0] = 0
-            errors.append(f"Exhaustiveness: Only {actual_count} rows, expected at least {expected_species_count}.")
+            errors.append(f"Exhaustiveness: Only {actual_count} rows, expected >= {expected_species_count}.")
         else:
             results[0] = 1
 
-        # Pertinence test: Suppose there's a column "Categorie" in the table
-        # We can check if any row has a category not in allowed_species_categories
-        # Because we only have "Espèce", "Description", etc. let's assume "Categorie" or "Famille"
-        # We'll just do a naive approach:
+        # 2) Pertinence: check if "Categorie" or "Famille" is in allowed list
+        # This requires you to have a real column for categories. We'll assume "Categorie" here.
         data = supabase.table("infos_especes").select("*").execute().data
-        invalid_cat = 0
-        for row in data:
-            # let's pretend there's a column "Categorie"
-            cat_val = row.get("Categorie", None)
-            if cat_val and cat_val not in allowed_species_categories:
-                invalid_cat += 1
-        if invalid_cat > 0:
-            results[1] = 0
-            errors.append(f"Pertinence: {invalid_cat} rows have invalid 'Categorie' values.")
+        if data and "Categorie" in data[0].keys():
+            invalid_cat_count = 0
+            for row in data:
+                cat_val = row.get("Categorie")
+                if cat_val and cat_val not in allowed_species_categories:
+                    invalid_cat_count += 1
+            if invalid_cat_count > 0:
+                results[1] = 0
+                errors.append(f"Pertinence: {invalid_cat_count} rows have invalid 'Categorie'.")
+            else:
+                results[1] = 1
         else:
-            results[1] = 1
+            # if no "Categorie" column, not applicable
+            results[1] = 2
 
-        # Accuracy test: check for duplicates in "Espèce"
+        # 3) Accuracy: check for duplicates in "Espèce" or missing cells
+        # also check if any "Espèce" is None
         species_counts = {}
+        null_species_count = 0
         for row in data:
-            sp = row.get("Espèce", "").strip() if row.get("Espèce") else ""
-            if not sp:
+            espece = row.get("Espèce")
+            if not espece:
+                null_species_count += 1
                 continue
-            species_counts[sp] = species_counts.get(sp, 0) + 1
-        duplicates = [k for k,v in species_counts.items() if v > 1]
+            species_counts[espece] = species_counts.get(espece, 0) + 1
+        duplicates = [k for k, v in species_counts.items() if v > 1]
         if duplicates:
+            errors.append(f"Accuracy: Duplicate Espèce found: {duplicates}")
+        if null_species_count > 0:
+            errors.append(f"Accuracy: Found {null_species_count} rows with null Espèce.")
+        if duplicates or null_species_count:
             results[2] = 0
-            errors.append(f"Accuracy: Found duplicate species: {duplicates}")
         else:
             results[2] = 1
 
     elif table_name == "footprint_images":
-        # For footprint_images, we'll do different checks
+        # 1) Exhaustiveness: species with images vs. total species in infos_especes
+        data_imgs = supabase.table("footprint_images").select("*").execute().data
+        data_species = supabase.table("infos_especes").select("id").execute().data
+        species_with_images = set(row["species_id"] for row in data_imgs if row.get("species_id"))
+        all_species_ids = set(row["id"] for row in data_species if row.get("id"))
 
-        # Exhaustiveness: ensure that the number of unique species with images
-        # matches the number of species in infos_especes. (Just as an example.)
-        # We can do a left join, but let's do it in a simpler approach:
-        r_images = supabase.table("footprint_images").select("species_id").execute().data
-        species_with_images = set(row["species_id"] for row in r_images if row.get("species_id") is not None)
-
-        r_species = supabase.table("infos_especes").select("id").execute().data
-        species_ids = set(row["id"] for row in r_species if row.get("id") is not None)
-
-        if len(species_with_images) < len(species_ids):
+        if len(species_with_images) < len(all_species_ids):
             results[0] = 0
             errors.append(
-                f"Exhaustiveness: Only {len(species_with_images)} species have images "
-                f"out of {len(species_ids)} total species."
+                f"Exhaustiveness: {len(species_with_images)}/{len(all_species_ids)} species have images."
             )
         else:
             results[0] = 1
 
-        # Pertinence test: Suppose footprint_images has a column "image_type"
-        # We'll check if it's in allowed_image_types. If not defined, we skip.
-        # We'll keep it not applicable if there's no 'image_type' column.
-        columns = supabase.table("footprint_images").select("*").limit(1).execute().data
-        if columns and "image_type" in columns[0].keys():
-            results[1] = 1  # assume pass
-            # check values
-            data_img = supabase.table("footprint_images").select("image_type").execute().data
-            invalid_type_count = 0
-            for row in data_img:
-                itype = row.get("image_type", None)
-                if itype and itype not in allowed_image_types:
-                    invalid_type_count += 1
-            if invalid_type_count > 0:
-                results[1] = 0
-                errors.append(f"Pertinence: {invalid_type_count} images with invalid 'image_type'.")
+        # 2) Pertinence: check if the image file extension is allowed (if we store file ext)
+        # In the current schema, we only have "image_name". We can check the extension from that.
+        invalid_ext_count = 0
+        for row in data_imgs:
+            img_name = row.get("image_name", "").lower()
+            if not any(img_name.endswith(ext) for ext in allowed_extensions):
+                invalid_ext_count += 1
+        if invalid_ext_count > 0:
+            results[1] = 0
+            errors.append(f"Pertinence: {invalid_ext_count} images have invalid file extension.")
         else:
-            # If there's no image_type column at all, we mark it not applicable
-            results[1] = 2
+            results[1] = 1
 
-        # Accuracy: check referential integrity. Each species_id must exist in infos_especes
+        # 3) Accuracy: check referential integrity, also check for missing "image_name"
         missing_refs = []
-        for sid in species_with_images:
-            if sid not in species_ids:
-                missing_refs.append(sid)
+        null_name_count = 0
+        for row in data_imgs:
+            sp_id = row.get("species_id")
+            if sp_id and sp_id not in all_species_ids:
+                missing_refs.append(sp_id)
+            if not row.get("image_name"):
+                null_name_count += 1
+
         if missing_refs:
+            errors.append(f"Accuracy: {len(missing_refs)} footprint_images rows with invalid species_id: {missing_refs}")
+        if null_name_count > 0:
+            errors.append(f"Accuracy: {null_name_count} rows with empty 'image_name'.")
+
+        if missing_refs or null_name_count:
             results[2] = 0
-            errors.append(f"Accuracy: The following species_ids in images do not exist in infos_especes: {missing_refs}")
         else:
             results[2] = 1
 
     else:
-        # If table_name is something else, no checks
+        # If table_name is something else
         results = [2, 2, 2]
 
     return results, errors
@@ -491,25 +531,16 @@ def main():
 
     supabase = get_supabase_client()
 
-    # If both tables are empty, reset them (TRUNCATE + RESTART IDENTITY).
+    # Step A: Possibly reset tables (only if both are empty)
     maybe_reset_tables(supabase)
 
-    # Fill or partially fill the infos_especes table
-    ensure_infos_especes_filled(
-        supabase=supabase,
-        bucket_name=BUCKET_NAME,
-        xlsx_blob_name="infos_especes.xlsx"
-    )
+    # Step B: Fill / upsert in infos_especes
+    ensure_infos_especes_filled(supabase, bucket_name=BUCKET_NAME, xlsx_blob_name="infos_especes.xlsx")
 
-    # Process images
-    process_images(
-        supabase=supabase,
-        bucket_name=BUCKET_NAME,
-        raw_folder_prefix="Mammifères/",
-        processed_folder_prefix="processed_data/"
-    )
+    # Step C: Process images with partial upsert
+    process_images(supabase, bucket_name=BUCKET_NAME, raw_folder_prefix="Mammifères/", processed_folder_prefix="processed_data/")
 
-    # Finally, run data quality checks and log results
+    # Step D: Run data quality checks and log
     run_data_quality_checks_and_log(supabase)
 
 if __name__ == "__main__":
