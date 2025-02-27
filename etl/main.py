@@ -104,12 +104,12 @@ def ensure_infos_especes_filled(
         fallback_files = [
             ("espece.xlsx", "Espèce"),
             ("description.xlsx", "Description"),
-            ("nom_latin.xlsx", "Nom latin"),
+            ("nom_latin.xlsx", "Nom_latin"),
             ("famille.xlsx", "Famille"),
             ("taille.xlsx", "Taille"),
             ("region.xlsx", "Région"),
             ("habitat.xlsx", "Habitat"),
-            ("fun_fact.xlsx", "Fun fact"),
+            ("fun_fact.xlsx", "Fun_fact"),
         ]
 
         # Fill missing cells from fallback
