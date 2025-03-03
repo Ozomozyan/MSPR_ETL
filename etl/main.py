@@ -7,6 +7,7 @@ ETL pipeline script for:
     - If footprint_images is empty, reset it
     - If both are empty, reset both
  2. Filling/updating infos_especes (merging fallback columns)
+    -> if 'Espèce' is missing, attempt to fill it from matching row data
  3. Processing images in Google Cloud Storage
     -> duplication/corruption checks, resizing, upserting references in footprint_images
     -> if image_name or image_url is missing, fill it from the other field when possible
@@ -87,6 +88,7 @@ def maybe_reset_tables(supabase: Client):
 def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_name: str):
     """
     Merges fallback columns, inserts new rows, updates empty cells in existing rows.
+    Then calls fill_missing_espece_fields() to handle missing Espèce if possible.
     """
     response = supabase.table("infos_especes").select("*").execute()
     count_infos = len(response.data)
@@ -113,12 +115,12 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
         fallback_files = [
             ("espece.xlsx", "Espèce"),
             ("description.xlsx", "Description"),
-            ("nom_latin.xlsx", "Nom latin"),
+            ("nom_latin.xlsx", "Nom_latin"),
             ("famille.xlsx", "Famille"),
             ("taille.xlsx", "Taille"),
             ("region.xlsx", "Région"),
             ("habitat.xlsx", "Habitat"),
-            ("fun_fact.xlsx", "Fun fact"),
+            ("fun_fact.xlsx", "Fun_fact"),
         ]
         for fallback_blob_name, col_name in fallback_files:
             fb_blob = bucket.blob(fallback_blob_name)
@@ -171,6 +173,55 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
                                 to_update[k] = v
                         if to_update:
                             supabase.table("infos_especes").update(to_update).eq("Espèce", espece).execute()
+
+    # After partial merges, try to fill missing Espèce using other columns
+    fill_missing_espece_fields(supabase)
+
+# -------------------------------------------------------------------------
+# 4B. FILL MISSING ESPÈCE FIELDS
+# -------------------------------------------------------------------------
+def fill_missing_espece_fields(supabase: Client):
+    """
+    If a row in infos_especes is missing 'Espèce', we attempt to fill it
+    by matching other columns (e.g. 'nom_latin', 'famille', 'region', 'habitat')
+    to rows that have 'Espèce'.
+    """
+    # Define which columns identify a species if 'Espèce' is missing
+    match_columns = ["nom_latin", "famille", "région", "habitat"]  # Adjust as needed
+
+    all_rows = supabase.table("infos_especes").select("*").execute().data
+    if not all_rows:
+        return
+
+    rows_with_espece = []
+    rows_missing_espece = []
+    for row in all_rows:
+        if row.get("Espèce"):
+            rows_with_espece.append(row)
+        else:
+            rows_missing_espece.append(row)
+
+    # Build a signature map for rows_with_espece
+    signature_map = defaultdict(list)
+    for row in rows_with_espece:
+        # build a tuple of the match columns
+        key_tuple = tuple(str(row.get(col, "")).strip().lower() if row.get(col) else "" for col in match_columns)
+        signature_map[key_tuple].append(row)  # might be multiple => ambiguous
+
+    updated_count = 0
+    for missing_row in rows_missing_espece:
+        row_id = missing_row.get("id")
+        key_tuple = tuple(str(missing_row.get(col, "")).strip().lower() if missing_row.get(col) else "" for col in match_columns)
+        candidate_matches = signature_map.get(key_tuple, [])
+        if len(candidate_matches) == 1:
+            # single match => fill Espèce
+            matched_espece = candidate_matches[0].get("Espèce")
+            if matched_espece:
+                supabase.table("infos_especes").update({"Espèce": matched_espece}).eq("id", row_id).execute()
+                updated_count += 1
+
+    if updated_count > 0:
+        print(f"Filled missing Espèce for {updated_count} row(s) in infos_especes.")
 
 # -------------------------------------------------------------------------
 # 5. PROCESS IMAGES & FILL MISSING FIELDS
@@ -543,7 +594,7 @@ def main():
     # A) selectively reset tables
     maybe_reset_tables(supabase)
 
-    # B) fill or partially fill infos_especes
+    # B) fill or partially fill infos_especes (includes fill_missing_espece_fields)
     ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
 
     # C) process images (partial upsert, fill missing name/url, remove duplicates)
