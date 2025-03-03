@@ -423,38 +423,6 @@ def cleanup_duplicates_in_footprint_images(supabase: Client):
             
             for dup in rows_to_delete:
                 supabase.table("footprint_images").delete().eq("id", dup["id"]).execute()
-                
-def cleanup_duplicates_in_infos_especes(supabase: Client):
-    """
-    Finds rows in `infos_especes` that share the same `Espèce`
-    and removes all but one. We keep the row with the smallest `id`.
-    """
-    all_rows = supabase.table("infos_especes").select("*").execute().data
-    if not all_rows:
-        return
-
-    # Group rows by their 'Espèce' value
-    duplicates_map = defaultdict(list)
-    for row in all_rows:
-        espece_val = row.get("Espèce", None)
-        duplicates_map[espece_val].append(row)
-
-    # For each group with more than 1 row => keep the smallest ID, remove the rest
-    for espece_val, group_rows in duplicates_map.items():
-        if len(group_rows) > 1:
-            # Sort ascending by "id"
-            group_rows.sort(key=lambda r: r["id"])
-            row_to_keep = group_rows[0]
-            rows_to_delete = group_rows[1:]
-
-            print(
-                f"[infos_especes] Found {len(group_rows)} duplicates for Espèce='{espece_val}'. "
-                f"Keeping row ID={row_to_keep['id']} and removing the others."
-            )
-
-            for dup in rows_to_delete:
-                supabase.table("infos_especes").delete().eq("id", dup["id"]).execute()
-
 
 # -------------------------------------------------------------------------
 # 6. FETCH SPECIES MAP
@@ -628,9 +596,6 @@ def main():
 
     # B) fill or partially fill infos_especes (includes fill_missing_espece_fields)
     ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
-    
-    # **NEW STEP**: cleanup duplicates in infos_especes now that 'Espèce' is filled
-    cleanup_duplicates_in_infos_especes(supabase)
 
     # C) process images (partial upsert, fill missing name/url, remove duplicates)
     process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
