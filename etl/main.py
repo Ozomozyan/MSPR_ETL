@@ -21,6 +21,7 @@ import numpy as np
 import tempfile
 import re
 import datetime
+import urllib.parse
 
 from PIL import Image
 from google.cloud import storage
@@ -335,22 +336,20 @@ def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_fold
 
         update_dict = {}
 
-        # CASE 1: image_name is missing but image_url is present
-        if (not name_in_db) and url_in_db:
-            # If your URL always looks like:
-            #   https://storage.googleapis.com/<bucket_name>/<processed_folder_prefix>/<speciesName>/filename.jpg
-            # we can parse the last segment as the image_name
-            # This might involve a more robust parse if the domain changes or if there's a query string
-            filename_candidate = url_in_db.split("/")[-1]  # naive parse
-            if filename_candidate:  # we found something
-                update_dict["image_name"] = filename_candidate
+        # CASE 1: Missing image_name, but we have image_url
+        if not name_in_db and url_in_db:
+            # Split out the last part of the URL
+            encoded_filename = url_in_db.split("/")[-1]
+            # Decode percent-encodings (e.g. "%28" -> "(", "%29" -> ")", "%20" -> " ")
+            decoded_filename = urllib.parse.unquote(encoded_filename)
+            
+            # If we successfully decoded something, use it
+            if decoded_filename:
+                update_dict["image_name"] = decoded_filename
 
-        # CASE 2: image_url is missing but image_name is present
-        if (not url_in_db) and name_in_db and species_id:
-            # We can fetch the species name from infos_especes to re-construct the GCS path
-            # or we can store it in footprint_images. We'll do a quick approach:
-            #  1) find the species name from species_id
-            #  2) build a GCS public URL. This might differ if your bucket is private.
+        # CASE 2: Missing image_url, but we have image_name
+        if not url_in_db and name_in_db and species_id:
+            # Rebuild the URL based on naming convention
             sp_row = (
                 supabase.table("infos_especes")
                 .select("Espèce")
@@ -360,8 +359,9 @@ def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_fold
             )
             if sp_row:
                 sp_name = sp_row[0].get("Espèce")
-                # Construct something like: f"https://storage.googleapis.com/{bucket_name}/{processed_folder_prefix}{sp_name}/{name_in_db}"
-                # This might not be exactly how your public URL is formed, so adapt as needed.
+                # The final URL typically includes the original (unencoded) filename,
+                # but GCS will still serve it with URL encoding when accessed publicly.
+                # We'll store the unencoded name in DB, but the actual link works fine.
                 new_url = f"https://storage.googleapis.com/{bucket_name}/{processed_folder_prefix}{sp_name}/{name_in_db}"
                 update_dict["image_url"] = new_url
 
