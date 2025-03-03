@@ -41,6 +41,10 @@ def get_supabase_client() -> Client:
 # 2. CONNECT TO GCS
 # -------------------------------------------------------------------------
 def get_gcs_client() -> storage.Client:
+    """
+    Returns a Google Cloud Storage client using the default credentials
+    set by the GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    """
     return storage.Client()
 
 # -------------------------------------------------------------------------
@@ -52,19 +56,13 @@ def maybe_reset_tables(supabase: Client):
       - If both are empty => reset both
       - Else if only one is empty => reset just that one
       - If neither is empty => skip
-    
-    NOTE: This requires one of the following:
-      1) Two separate RPCs: reset_infos_especes() & reset_footprint_images()
-      2) A single RPC that takes a parameter indicating which table to reset
-         e.g. supabase.rpc("reset_table", {"table_name": "infos_especes"})
-      3) A single RPC that truncates both, but you only call it when needed
-         => not enough, because you want partial resets
 
-    For demonstration, let's assume you have a single RPC "reset_one_table(table_name)"
-    that truncates the named table. Then we call it as needed.
-    You must implement that in your DB or adjust to your approach.
+    We assume the existence of:
+      1) A supabase RPC 'reset_my_tables' that truncates both at once
+      2) A supabase RPC 'reset_one_table(table_name)' that truncates one table
+         (with RESTART IDENTITY CASCADE, etc.)
+    Adapt as needed for your environment.
     """
-
     r_especes = supabase.table("infos_especes").select("id").limit(1).execute()
     r_images = supabase.table("footprint_images").select("id").limit(1).execute()
 
@@ -73,8 +71,7 @@ def maybe_reset_tables(supabase: Client):
 
     if count_especes == 0 and count_images == 0:
         print("Both infos_especes and footprint_images are empty. Resetting BOTH tables...")
-        # Suppose we have an RPC that truncates both at once:
-        supabase.rpc("reset_my_tables").execute()  # or do 2 calls to 'reset_one_table'
+        supabase.rpc("reset_my_tables").execute()  # single RPC to reset both
     elif count_especes == 0:
         print("infos_especes is empty; resetting just infos_especes.")
         supabase.rpc("reset_one_table", {"table_name": "infos_especes"}).execute()
@@ -92,9 +89,11 @@ def maybe_reset_tables(supabase: Client):
 # -------------------------------------------------------------------------
 def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_name: str):
     """
-    Similar to before: merges fallback columns, inserts new rows, updates empty cells
-    in existing rows. No changes from your previous code except we rely on the
-    new maybe_reset_tables logic above.
+    1) If infos_especes is empty, insert all rows from the main Excel.
+    2) If not empty, do partial merges:
+       - Insert new species (Espèce) if not found
+       - For existing species, fill missing columns from the DataFrame
+    3) Also merges fallback columns from other Excel files.
     """
     response = supabase.table("infos_especes").select("*").execute()
     count_infos = len(response.data)
@@ -108,7 +107,7 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
     bucket = gcs_client.bucket(bucket_name)
     blob_main = bucket.blob(xlsx_blob_name)
     if not blob_main.exists():
-        raise FileNotFoundError(f"Could not find {xlsx_blob_name} in {bucket_name}.")
+        raise FileNotFoundError(f"Could not find {xlsx_blob_name} in bucket '{bucket_name}'.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_main_path = os.path.join(tmpdir, xlsx_blob_name)
@@ -117,7 +116,7 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
 
         df_main = pd.read_excel(local_main_path)
 
-        # Fallback merges...
+        # Merge fallback files
         fallback_files = [
             ("espece.xlsx", "Espèce"),
             ("description.xlsx", "Description"),
@@ -140,7 +139,7 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
                         if pd.isnull(df_main.loc[i, col_name]):
                             df_main.loc[i, col_name] = fb_df.loc[i, col_name]
 
-        # Clean up infinite, None
+        # Convert inf -> nan, then nan -> None
         df_main.replace([np.inf, -np.inf], np.nan, inplace=True)
         df_main = df_main.where(df_main.notnull(), None)
 
@@ -152,14 +151,14 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
 
         records = df_main.to_dict(orient="records")
 
+        # If table empty => insert everything
         if count_infos == 0:
-            # Insert all
             chunk_size = 500
             for i in range(0, len(records), chunk_size):
                 batch = records[i : i + chunk_size]
                 supabase.table("infos_especes").insert(batch).execute()
         else:
-            # Upsert logic (like you had):
+            # partial upsert
             existing_species = set()
             existing_data = supabase.table("infos_especes").select("Espèce").execute().data
             for row in existing_data:
@@ -172,7 +171,7 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
                 if espece not in existing_species:
                     supabase.table("infos_especes").insert(rec).execute()
                 else:
-                    # partial update if needed
+                    # partial update
                     existing_row_q = supabase.table("infos_especes").select("*").eq("Espèce", espece).limit(1).execute()
                     if existing_row_q.data:
                         existing_row = existing_row_q.data[0]
@@ -184,7 +183,7 @@ def ensure_infos_especes_filled(supabase: Client, bucket_name: str, xlsx_blob_na
                             supabase.table("infos_especes").update(to_update).eq("Espèce", espece).execute()
 
 # -------------------------------------------------------------------------
-# 5. PROCESS IMAGES WITH LOGIC TO FILL MISSING FIELDS
+# 5. PROCESS IMAGES (RESIZE, DUPLICATE CHECK, PARTIAL UPSERT) & FILL MISSING FIELDS
 # -------------------------------------------------------------------------
 def process_images(
     supabase: Client,
@@ -192,14 +191,23 @@ def process_images(
     raw_folder_prefix: str = "Mammifères/",
     processed_folder_prefix: str = "processed_data/"
 ):
+    """
+    1) Lists images in GCS under raw_folder_prefix (Mammifères/<SpeciesName>/<file>).
+    2) Downloads each image, checks corruption, duplicates, extension.
+    3) Resizes => uploads to processed_folder_prefix => upsert in 'footprint_images'.
+    4) Then calls fill_missing_image_fields(...) to attempt to fill empty image_name or image_url if possible.
+    """
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
 
+    # species_map helps map species_name => species_id in DB
     species_map = fetch_species_map(supabase)
 
+    # List candidate images
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
     image_candidates = []
     for blob in raw_blobs:
+        # skip "directories"
         if blob.name.endswith("/"):
             continue
         parts = blob.name.split("/")
@@ -217,7 +225,7 @@ def process_images(
     images_to_upload = []
 
     for blob_name, species_name, image_filename in image_candidates:
-        # Skip if species not found
+        # skip if species not found
         if species_name not in species_map:
             print(f"Species '{species_name}' not found in DB. Skipping {blob_name}.")
             continue
@@ -231,7 +239,7 @@ def process_images(
             print(f"Error downloading {blob_name}: {e}")
             continue
 
-        # Check corruption
+        # check corruption
         try:
             with Image.open(local_raw_path) as im:
                 im.verify()
@@ -239,20 +247,20 @@ def process_images(
             print(f"Corrupt image {blob_name}: {e}")
             continue
 
-        # Duplicate check
+        # duplicate check
         filehash = hashlib.md5(open(local_raw_path, "rb").read()).hexdigest()
         if filehash in seen_hashes:
             print(f"Duplicate image {blob_name}. Skipping.")
             continue
         seen_hashes.add(filehash)
 
-        # Extension check
+        # extension check
         valid_exts = (".jpg", ".jpeg", ".png")
         if not image_filename.lower().endswith(valid_exts):
             print(f"Invalid extension for {image_filename}, skipping.")
             continue
 
-        # Resize
+        # resize
         local_proc_path = os.path.join(tmp_proc, image_filename)
         try:
             with Image.open(local_raw_path) as im:
@@ -264,7 +272,7 @@ def process_images(
 
         images_to_upload.append((local_proc_path, species_name, image_filename))
 
-    # Upload processed & upsert in DB
+    # Upload processed => upsert
     for local_path, species_name, filename in images_to_upload:
         new_blob_path = f"{processed_folder_prefix}{species_name}/{filename}"
         new_blob = bucket.blob(new_blob_path)
@@ -274,14 +282,14 @@ def process_images(
             print(f"Error uploading processed {local_path}: {e}")
             continue
 
-        # Build a record
+        # build record
         record = {
             "species_id": species_map[species_name],
             "image_name": filename,
             "image_url": new_blob.public_url,
         }
 
-        # Attempt partial upsert
+        # partial upsert
         existing_q = (
             supabase.table("footprint_images")
             .select("*")
@@ -291,7 +299,6 @@ def process_images(
         )
         existing_data = existing_q.data
         if existing_data:
-            # fill missing fields if any
             row_in_db = existing_data[0]
             updates = {}
             for k, v in record.items():
@@ -299,32 +306,21 @@ def process_images(
                     updates[k] = v
             if updates:
                 supabase.table("footprint_images") \
-                    .update(updates) \
-                    .eq("species_id", record["species_id"]) \
-                    .eq("image_name", filename) \
-                    .execute()
+                        .update(updates) \
+                        .eq("species_id", record["species_id"]) \
+                        .eq("image_name", filename) \
+                        .execute()
         else:
             supabase.table("footprint_images").insert(record).execute()
 
-    # ---------------------------------------------
-    # EXTRA: After we've done the normal upsert, we can fix any rows missing
-    # either image_name or image_url in the DB by cross-checking one from the other
-    # If you want to handle the case: "We had a row with only url, but name is missing"
-    # or "We had a row with only name, but url is missing," we can do so here:
+    # after standard upserts, fill missing fields
     fill_missing_image_fields(supabase, bucket_name, processed_folder_prefix)
-    # ---------------------------------------------
-
     print("Image processing complete.")
-
 
 def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_folder_prefix: str):
     """
     If a row in footprint_images is missing image_name but has image_url, or vice versa,
-    we can attempt to fill the missing piece by parsing the known piece.
-
-    Example approach:
-      - If image_name is None but we have image_url => parse from the URL
-      - If image_url is None but we have image_name => reconstruct using bucket_name + processed_folder_prefix + ...
+    we try to fill. E.g. we decode from the URL or build from the name.
     """
     rows = supabase.table("footprint_images").select("*").execute().data
     updated_count = 0
@@ -333,23 +329,20 @@ def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_fold
         species_id = r.get("species_id")
         name_in_db = r.get("image_name")
         url_in_db = r.get("image_url")
+        row_id = r.get("id")
 
         update_dict = {}
 
-        # CASE 1: Missing image_name, but we have image_url
+        # CASE 1: missing image_name, but we have image_url
         if not name_in_db and url_in_db:
-            # Split out the last part of the URL
-            encoded_filename = url_in_db.split("/")[-1]
-            # Decode percent-encodings (e.g. "%28" -> "(", "%29" -> ")", "%20" -> " ")
-            decoded_filename = urllib.parse.unquote(encoded_filename)
-            
-            # If we successfully decoded something, use it
+            encoded_filename = url_in_db.split("/")[-1]  # e.g. "Beaver-Tracks-%287%29.jpg"
+            decoded_filename = urllib.parse.unquote(encoded_filename)  # => "Beaver-Tracks-(7).jpg"
             if decoded_filename:
                 update_dict["image_name"] = decoded_filename
 
-        # CASE 2: Missing image_url, but we have image_name
+        # CASE 2: missing image_url, but we have image_name
         if not url_in_db and name_in_db and species_id:
-            # Rebuild the URL based on naming convention
+            # get species name
             sp_row = (
                 supabase.table("infos_especes")
                 .select("Espèce")
@@ -359,14 +352,19 @@ def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_fold
             )
             if sp_row:
                 sp_name = sp_row[0].get("Espèce")
-                # The final URL typically includes the original (unencoded) filename,
-                # but GCS will still serve it with URL encoding when accessed publicly.
-                # We'll store the unencoded name in DB, but the actual link works fine.
-                new_url = f"https://storage.googleapis.com/{bucket_name}/{processed_folder_prefix}{sp_name}/{name_in_db}"
+                # build a plausible GCS public URL
+                # might be: "https://storage.googleapis.com/<bucket>/processed_data/<sp_name>/<filename>"
+                new_url = (
+                    f"https://storage.googleapis.com/{bucket_name}/"
+                    f"{processed_folder_prefix}{sp_name}/{name_in_db}"
+                )
                 update_dict["image_url"] = new_url
 
         if update_dict:
-            supabase.table("footprint_images").update(update_dict).eq("id", r["id"]).execute()
+            supabase.table("footprint_images") \
+                    .update(update_dict) \
+                    .eq("id", row_id) \
+                    .execute()
             updated_count += 1
 
     if updated_count > 0:
@@ -376,16 +374,27 @@ def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_fold
 # 6. FETCH SPECIES MAP
 # -------------------------------------------------------------------------
 def fetch_species_map(supabase: Client) -> dict:
+    """
+    Returns a dict {species_name -> id} from infos_especes.
+    """
     data = supabase.table("infos_especes").select("id, Espèce").execute()
     sp_map = {}
     for row in data.data:
-        sp_map[row["Espèce"]] = row["id"]
+        sp_name = row["Espèce"]
+        sp_id = row["id"]
+        sp_map[sp_name] = sp_id
     return sp_map
 
 # -------------------------------------------------------------------------
 # 7. DATA QUALITY CONTROL & LOGGING
 # -------------------------------------------------------------------------
 def run_data_quality_checks_and_log(supabase: Client):
+    """
+    Run your data quality tests for:
+     1) infos_especes
+     2) footprint_images
+    Then store results in data_quality_log table.
+    """
     run_timestamp = datetime.datetime.utcnow().isoformat()
 
     # Example references
@@ -396,6 +405,7 @@ def run_data_quality_checks_and_log(supabase: Client):
     ]
     allowed_extensions = [".jpg", ".jpeg", ".png"]
 
+    # We'll run checks on these two tables
     tables_to_check = ["infos_especes", "footprint_images"]
     for tbl in tables_to_check:
         results_vector, errors = run_quality_tests_for_table(
@@ -405,6 +415,7 @@ def run_data_quality_checks_and_log(supabase: Client):
         test_vector_str = str(results_vector)
         error_desc = "; ".join(errors) if errors else "No issues detected"
 
+        # Insert log record
         supabase.table("data_quality_log").insert({
             "execution_time": run_timestamp,
             "table_name": tbl,
@@ -423,15 +434,16 @@ def run_quality_tests_for_table(
 ) -> (list, list):
     """
     We do 3 tests for each table: Exhaustiveness, Pertinence, Accuracy
-    plus some checks for missing cells. We'll keep it similar to before.
+    plus some checks for missing cells.
+
+    results = [exhaustiveness, pertinence, accuracy]
+    0=fail, 1=pass, 2=n/a
     """
-    # results = [Exhaustiveness, Pertinence, Accuracy]
-    # 0 = fail, 1 = pass, 2 = n/a
     results = [2, 2, 2]
     errors = []
 
     if table_name == "infos_especes":
-        # 1) Exhaustiveness
+        # (1) Exhaustiveness
         r = supabase.table("infos_especes").select("id", count="exact").execute()
         actual_count = r.count or len(r.data)
         if actual_count < expected_species_count:
@@ -440,23 +452,23 @@ def run_quality_tests_for_table(
         else:
             results[0] = 1
 
-        # 2) Pertinence: check if there's a known category column. We'll do "Categorie".
+        # (2) Pertinence: check if there's a "Categorie" column
         rows = supabase.table("infos_especes").select("*").execute().data
         if rows and "Categorie" in rows[0]:
-            invalid_count = 0
+            invalid_cat = 0
             for row in rows:
                 cval = row.get("Categorie")
                 if cval and cval not in allowed_species_categories:
-                    invalid_count += 1
-            if invalid_count > 0:
+                    invalid_cat += 1
+            if invalid_cat > 0:
                 results[1] = 0
-                errors.append(f"Pertinence: {invalid_count} row(s) have invalid 'Categorie'.")
+                errors.append(f"Pertinence: {invalid_cat} row(s) have invalid 'Categorie'.")
             else:
                 results[1] = 1
         else:
             results[1] = 2
 
-        # 3) Accuracy: duplicates or missing Espèce
+        # (3) Accuracy: duplicates or missing Espèce
         species_counts = {}
         null_espece = 0
         for row in rows:
@@ -467,7 +479,7 @@ def run_quality_tests_for_table(
             species_counts[sp] = species_counts.get(sp, 0) + 1
         duplicates = [k for k, v in species_counts.items() if v > 1]
         if duplicates:
-            errors.append(f"Accuracy: Duplicate Espèce found => {duplicates}")
+            errors.append(f"Accuracy: Duplicate Espèce => {duplicates}")
         if null_espece > 0:
             errors.append(f"Accuracy: {null_espece} row(s) missing Espèce.")
         if duplicates or null_espece:
@@ -476,7 +488,7 @@ def run_quality_tests_for_table(
             results[2] = 1
 
     elif table_name == "footprint_images":
-        # 1) Exhaustiveness
+        # (1) Exhaustiveness
         data_imgs = supabase.table("footprint_images").select("*").execute().data
         data_species = supabase.table("infos_especes").select("id").execute().data
         sp_with_imgs = set(r["species_id"] for r in data_imgs if r.get("species_id") is not None)
@@ -487,7 +499,7 @@ def run_quality_tests_for_table(
         else:
             results[0] = 1
 
-        # 2) Pertinence: check file extension from image_name
+        # (2) Pertinence: check file extension from image_name
         invalid_ext = 0
         for row in data_imgs:
             iname = row.get("image_name", "").lower()
@@ -499,7 +511,7 @@ def run_quality_tests_for_table(
         else:
             results[1] = 1
 
-        # 3) Accuracy: referential integrity & missing fields
+        # (3) Accuracy: referential integrity & missing fields
         missing_sp = []
         missing_name = 0
         missing_url = 0
@@ -523,8 +535,8 @@ def run_quality_tests_for_table(
             results[2] = 1
 
     else:
-        # Some other table
-        results = [2,2,2]
+        # Some other table (not relevant here)
+        results = [2, 2, 2]
 
     return results, errors
 
@@ -538,16 +550,16 @@ def main():
 
     supabase = get_supabase_client()
 
-    # A) selectively reset tables
+    # Step A) selectively reset tables
     maybe_reset_tables(supabase)
 
-    # B) fill or partially fill infos_especes
+    # Step B) fill or partially fill infos_especes
     ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
 
-    # C) process images with partial upsert, fill missing name/url
+    # Step C) process images (duplicate check, resizing, partial upsert), then fill missing name/url
     process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
 
-    # D) run data quality checks
+    # Step D) run data quality checks
     run_data_quality_checks_and_log(supabase)
 
 if __name__ == "__main__":
