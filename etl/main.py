@@ -532,26 +532,40 @@ def run_quality_tests_for_table(
     table_name: str,
     expected_species_count: int,
     allowed_species_categories: list,
-    allowed_extensions: list
+    allowed_extensions: list,
+    bucket_name: str = None,
+    raw_folder_prefix: str = "Mammifères/"
 ) -> (list, list):
     """
-    We do 3 tests for each table: Exhaustiveness, Pertinence, Accuracy
-    plus checks for missing cells (e.g. image_name).
+    Returns (results_vector, errors_list) where:
+      results_vector = [exhaustiveness, pertinence, accuracy]
+         each = 0 (fail), 1 (pass), 2 (N/A)
     """
     results = [2, 2, 2]  # [Exhaustiveness, Pertinence, Accuracy]
     errors = []
 
-    if table_name == "infos_especes":
-        # 1) Exhaustiveness
-        r = supabase.table("infos_especes").select("id", count="exact").execute()
-        actual_count = r.count or len(r.data)
-        if actual_count < expected_species_count:
-            results[0] = 0
-            errors.append(f"Exhaustiveness: {actual_count} rows, expected >= {expected_species_count}.")
-        else:
-            results[0] = 1
+    # For cross-checking GCS files vs DB
+    gcs_client = get_gcs_client() if bucket_name else None
+    bucket = gcs_client.bucket(bucket_name) if gcs_client else None
 
-        # 2) Pertinence
+    if table_name == "infos_especes":
+        # ------------------------------------------------------------------------------
+        # 1) Exhaustiveness
+        # ------------------------------------------------------------------------------
+        res = supabase.table("infos_especes").select("id", count="exact").execute()
+        actual_count = res.count or len(res.data)
+
+        if actual_count < expected_species_count:
+            results[0] = 0  # fail
+            errors.append(
+                f"Exhaustiveness: Only {actual_count} rows in infos_especes, expected >= {expected_species_count}."
+            )
+        else:
+            results[0] = 1  # pass
+
+        # ------------------------------------------------------------------------------
+        # 2) Pertinence (category checks, etc.)
+        # ------------------------------------------------------------------------------
         rows = supabase.table("infos_especes").select("*").execute().data
         if rows and "Categorie" in rows[0]:
             invalid_count = 0
@@ -561,13 +575,16 @@ def run_quality_tests_for_table(
                     invalid_count += 1
             if invalid_count > 0:
                 results[1] = 0
-                errors.append(f"Pertinence: {invalid_count} row(s) with invalid 'Categorie'.")
+                errors.append(f"Pertinence: {invalid_count} row(s) have invalid 'Categorie'.")
             else:
                 results[1] = 1
         else:
+            # maybe 'Categorie' doesn't exist => no check
             results[1] = 2
 
-        # 3) Accuracy: check duplicates or missing Espèce
+        # ------------------------------------------------------------------------------
+        # 3) Accuracy (duplicates, missing Espèce, etc.)
+        # ------------------------------------------------------------------------------
         species_counts = {}
         null_espece = 0
         for row in rows:
@@ -576,41 +593,76 @@ def run_quality_tests_for_table(
                 null_espece += 1
                 continue
             species_counts[sp] = species_counts.get(sp, 0) + 1
+
         duplicates = [k for k, v in species_counts.items() if v > 1]
         if duplicates:
             errors.append(f"Accuracy: Duplicate Espèce => {duplicates}")
         if null_espece > 0:
             errors.append(f"Accuracy: {null_espece} row(s) missing Espèce.")
+
         if duplicates or null_espece:
             results[2] = 0
         else:
             results[2] = 1
 
     elif table_name == "footprint_images":
+        # ------------------------------------------------------------------------------
         # 1) Exhaustiveness
-        data_imgs = supabase.table("footprint_images").select("*").execute().data
-        data_species = supabase.table("infos_especes").select("id").execute().data
-        sp_with_imgs = {r["species_id"] for r in data_imgs if r.get("species_id")}
-        sp_all = {r["id"] for r in data_species if r.get("id")}
-        if len(sp_with_imgs) < len(sp_all):
-            results[0] = 0
-            errors.append(f"Exhaustiveness: {len(sp_with_imgs)}/{len(sp_all)} species have images.")
-        else:
-            results[0] = 1
+        # ------------------------------------------------------------------------------
+        data_imgs = supabase.table("footprint_images").select("id, species_id, image_name, image_url").execute().data
+        
+        # compare number of DB rows to the actual files in GCS (raw_folder_prefix)
+        # This is an example logic: how many "Mammifères/.../*.jpg" are in GCS vs how many are in DB?
+        if bucket:
+            gcs_blobs = list(bucket.list_blobs(prefix=raw_folder_prefix))
+            # Filter to actual files
+            gcs_files = [
+                b.name for b in gcs_blobs 
+                if not b.name.endswith("/") and (b.name.lower().endswith(".jpg") 
+                                                 or b.name.lower().endswith(".jpeg") 
+                                                 or b.name.lower().endswith(".png"))
+            ]
+            gcs_count = len(gcs_files)
+            db_count = len(data_imgs)
 
-        # 2) Pertinence: check file extension from image_name
+            # Decide how you define "exhaustive": do you want them to match exactly?
+            # or do you just want DB_count >= some threshold?
+            if db_count < gcs_count:
+                results[0] = 0
+                errors.append(f"Exhaustiveness: DB has {db_count} images but GCS has {gcs_count} images.")
+            else:
+                results[0] = 1
+        else:
+            # No bucket provided => skip
+            results[0] = 2
+
+        # ------------------------------------------------------------------------------
+        # 2) Pertinence (file extension checks, correct species folder, etc.)
+        # ------------------------------------------------------------------------------
         invalid_ext = 0
         for row in data_imgs:
-            iname = row.get("image_name", "").lower()
+            iname = (row.get("image_name") or "").lower()
             if iname and not any(iname.endswith(ext) for ext in allowed_extensions):
                 invalid_ext += 1
+
         if invalid_ext > 0:
             results[1] = 0
-            errors.append(f"Pertinence: {invalid_ext} images with invalid file extension.")
+            errors.append(f"Pertinence: {invalid_ext} images have an invalid extension.")
         else:
             results[1] = 1
 
-        # 3) Accuracy: missing fields, referential integrity
+        # Optionally, check if the species folder in GCS matches the species name in DB:
+        #    1) fetch species from infos_especes
+        #    2) ensure that the "folder" portion of the path matches the "Espèce"
+        #    (This is an example idea; adapt as needed.)
+
+        # ------------------------------------------------------------------------------
+        # 3) Accuracy (referential integrity, duplicates, missing fields, etc.)
+        # ------------------------------------------------------------------------------
+        data_species = supabase.table("infos_especes").select("id").execute().data
+        sp_all = {r["id"] for r in data_species if r.get("id")}
+
+        # Check invalid references, missing image_name/url
         missing_sp = []
         missing_name = 0
         missing_url = 0
@@ -622,18 +674,31 @@ def run_quality_tests_for_table(
                 missing_name += 1
             if not row.get("image_url"):
                 missing_url += 1
+
         if missing_sp:
             errors.append(f"Accuracy: {len(missing_sp)} images reference invalid species_id => {missing_sp}")
         if missing_name > 0:
             errors.append(f"Accuracy: {missing_name} row(s) missing image_name.")
         if missing_url > 0:
             errors.append(f"Accuracy: {missing_url} row(s) missing image_url.")
-        if missing_sp or missing_name or missing_url:
+
+        # Also check duplicates by (species_id, image_name)
+        duplicates_map = defaultdict(int)
+        for r in data_imgs:
+            key = (r.get("species_id"), r.get("image_name"))
+            duplicates_map[key] += 1
+        dups = [k for k, count in duplicates_map.items() if count > 1]
+        if dups:
+            errors.append(f"Accuracy: Duplicate (species_id, image_name) => {dups}")
+
+        # If any errors in Accuracy => fail
+        if missing_sp or missing_name or missing_url or dups:
             results[2] = 0
         else:
             results[2] = 1
 
     else:
+        # For other tables not in [infos_especes, footprint_images], skip checks
         results = [2,2,2]
 
     return results, errors
@@ -643,25 +708,46 @@ def run_quality_tests_for_table(
 # -------------------------------------------------------------------------
 def main():
     BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "bucket-mspr_epsi-vine-449913-f6")
-    if not BUCKET_NAME:
-        raise ValueError("Please set GCS_BUCKET_NAME in environment.")
-
     supabase = get_supabase_client()
 
-    # A) selectively reset tables
-    maybe_reset_tables(supabase)
+    # For overall logging
+    overall_success = True
+    overall_errors = []
 
-    # B) fill or partially fill infos_especes (includes fill_missing_espece_fields)
-    ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
-    
-    # **NEW STEP**: cleanup duplicates in infos_especes now that 'Espèce' is filled
-    cleanup_duplicates_in_infos_especes(supabase)
+    try:
+        maybe_reset_tables(supabase)
+    except Exception as e:
+        overall_success = False
+        overall_errors.append(f"Error in maybe_reset_tables: {e}")
 
-    # C) process images (partial upsert, fill missing name/url, remove duplicates)
-    process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
+    try:
+        ensure_infos_especes_filled(supabase, BUCKET_NAME, "infos_especes.xlsx")
+        cleanup_duplicates_in_infos_especes(supabase)
+    except Exception as e:
+        overall_success = False
+        overall_errors.append(f"Error in infos_especes step: {e}")
 
-    # D) run data quality checks
-    run_data_quality_checks_and_log(supabase)
+    try:
+        process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
+    except Exception as e:
+        overall_success = False
+        overall_errors.append(f"Error in process_images: {e}")
+
+    # Run data quality last
+    try:
+        run_data_quality_checks_and_log(supabase)
+    except Exception as e:
+        overall_success = False
+        overall_errors.append(f"Error in data quality checks: {e}")
+
+    # Finally, log the overall success/failure if you want a single line in data_quality_log:
+    run_timestamp = datetime.datetime.utcnow().isoformat()
+    supabase.table("data_quality_log").insert({
+        "execution_time": run_timestamp,
+        "table_name": "ETL_process",  # or "all_tables"
+        "test_results": "[1]" if overall_success else "[0]",
+        "error_description": ("No errors" if overall_success else "; ".join(overall_errors))
+    }).execute()
 
 if __name__ == "__main__":
     main()
