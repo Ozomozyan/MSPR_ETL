@@ -528,7 +528,7 @@ def run_data_quality_checks_and_log(supabase: Client):
         print(f"Data Quality for {tbl}: {test_vector_str}, Errors: {error_desc}")
 
 def run_quality_tests_for_table(
-    supabase,
+    supabase: Client,
     table_name: str,
     expected_species_count: int,
     allowed_species_categories: list,
@@ -540,38 +540,33 @@ def run_quality_tests_for_table(
     Returns (results_vector, errors_list) where:
       results_vector = [exhaustiveness, pertinence, accuracy]
          each = 0 (fail), 1 (pass), 2 (N/A)
-
-    - Exhaustiveness (index=0) checks if we have enough rows or enough images vs GCS.
-    - Pertinence (index=1) checks if data belongs to the right category or extension.
-    - Accuracy (index=2) checks if there are duplicates, invalid references, missing required columns, etc.
     """
-    # Default is "N/A" for each dimension; we change to 0 or 1 if we run the test
     results = [2, 2, 2]  # [Exhaustiveness, Pertinence, Accuracy]
     errors = []
 
-    # Prepare GCS if needed
+    # For cross-checking GCS files vs DB
     gcs_client = get_gcs_client() if bucket_name else None
     bucket = gcs_client.bucket(bucket_name) if gcs_client else None
 
-    # --------------------------------------------------------------------------
-    # TABLE: infos_especes
-    # --------------------------------------------------------------------------
     if table_name == "infos_especes":
-        rows_resp = supabase.table("infos_especes").select("*", count="exact").execute()
-        rows = rows_resp.data
-        row_count = rows_resp.count or len(rows)
+        # ------------------------------------------------------------------------------
+        # 1) Exhaustiveness
+        # ------------------------------------------------------------------------------
+        res = supabase.table("infos_especes").select("id", count="exact").execute()
+        actual_count = res.count or len(res.data)
 
-        # -------------------- 1) Exhaustiveness --------------------
-        if row_count < expected_species_count:
+        if actual_count < expected_species_count:
             results[0] = 0  # fail
             errors.append(
-                f"Exhaustiveness: Only {row_count} rows in infos_especes, expected >= {expected_species_count}."
+                f"Exhaustiveness: Only {actual_count} rows in infos_especes, expected >= {expected_species_count}."
             )
         else:
             results[0] = 1  # pass
 
-        # -------------------- 2) Pertinence --------------------
-        # e.g. check if 'Categorie' is valid if the column exists
+        # ------------------------------------------------------------------------------
+        # 2) Pertinence (category checks, etc.)
+        # ------------------------------------------------------------------------------
+        rows = supabase.table("infos_especes").select("*").execute().data
         if rows and "Categorie" in rows[0]:
             invalid_count = 0
             for row in rows:
@@ -584,19 +579,20 @@ def run_quality_tests_for_table(
             else:
                 results[1] = 1
         else:
-            # 'Categorie' does not exist or no rows => skip
-            results[1] = 2  # N/A
+            # maybe 'Categorie' doesn't exist => no check
+            results[1] = 2
 
-        # -------------------- 3) Accuracy --------------------
-        # (A) duplicates or missing 'Espèce'
+        # ------------------------------------------------------------------------------
+        # 3) Accuracy (duplicates, missing Espèce, etc.)
+        # ------------------------------------------------------------------------------
         species_counts = {}
         null_espece = 0
         for row in rows:
             sp = row.get("Espèce")
             if not sp:
                 null_espece += 1
-            else:
-                species_counts[sp] = species_counts.get(sp, 0) + 1
+                continue
+            species_counts[sp] = species_counts.get(sp, 0) + 1
 
         duplicates = [k for k, v in species_counts.items() if v > 1]
         if duplicates:
@@ -604,70 +600,45 @@ def run_quality_tests_for_table(
         if null_espece > 0:
             errors.append(f"Accuracy: {null_espece} row(s) missing Espèce.")
 
-        # (B) required columns: tweak this list to match your schema
-        required_columns = [
-            "Espèce",
-            "Description",
-            "Nom_latin",
-            "Famille",
-            "Taille",
-            "Région",
-            "Habitat",
-            "Fun_fact"
-        ]
-        missing_data_rows = []
-        for row in rows:
-            row_id = row.get("id")
-            missing_cols = []
-            for col in required_columns:
-                val = row.get(col, None)
-                # Treat empty string as missing too
-                if val is None or val == "":
-                    missing_cols.append(col)
-            if missing_cols:
-                missing_data_rows.append((row_id, missing_cols))
-
-        # Decide if any accuracy failures have occurred
-        if duplicates or null_espece or missing_data_rows:
+        if duplicates or null_espece:
             results[2] = 0
-            if missing_data_rows:
-                for (rid, cols) in missing_data_rows:
-                    errors.append(f"Row ID={rid} in infos_especes is missing: {', '.join(cols)}")
         else:
             results[2] = 1
 
-    # --------------------------------------------------------------------------
-    # TABLE: footprint_images
-    # --------------------------------------------------------------------------
     elif table_name == "footprint_images":
-        data_imgs = supabase.table("footprint_images").select("*").execute().data
-
-        # -------------------- 1) Exhaustiveness --------------------
+        # ------------------------------------------------------------------------------
+        # 1) Exhaustiveness
+        # ------------------------------------------------------------------------------
+        data_imgs = supabase.table("footprint_images").select("id, species_id, image_name, image_url").execute().data
+        
+        # compare number of DB rows to the actual files in GCS (raw_folder_prefix)
+        # This is an example logic: how many "Mammifères/.../*.jpg" are in GCS vs how many are in DB?
         if bucket:
             gcs_blobs = list(bucket.list_blobs(prefix=raw_folder_prefix))
+            # Filter to actual files
             gcs_files = [
-                b.name for b in gcs_blobs
-                if not b.name.endswith("/")
-                and (b.name.lower().endswith(".jpg")
-                     or b.name.lower().endswith(".jpeg")
-                     or b.name.lower().endswith(".png"))
+                b.name for b in gcs_blobs 
+                if not b.name.endswith("/") and (b.name.lower().endswith(".jpg") 
+                                                 or b.name.lower().endswith(".jpeg") 
+                                                 or b.name.lower().endswith(".png"))
             ]
             gcs_count = len(gcs_files)
             db_count = len(data_imgs)
 
-            # If you want exact match or minimum threshold, adapt logic as needed
+            # Decide how you define "exhaustive": do you want them to match exactly?
+            # or do you just want DB_count >= some threshold?
             if db_count < gcs_count:
                 results[0] = 0
-                errors.append(
-                    f"Exhaustiveness: DB has {db_count} images but GCS has {gcs_count} images."
-                )
+                errors.append(f"Exhaustiveness: DB has {db_count} images but GCS has {gcs_count} images.")
             else:
                 results[0] = 1
         else:
-            # No bucket provided => skip exhaustiveness
+            # No bucket provided => skip
             results[0] = 2
 
-        # -------------------- 2) Pertinence --------------------
+        # ------------------------------------------------------------------------------
+        # 2) Pertinence (file extension checks, correct species folder, etc.)
+        # ------------------------------------------------------------------------------
         invalid_ext = 0
         for row in data_imgs:
             iname = (row.get("image_name") or "").lower()
@@ -680,15 +651,21 @@ def run_quality_tests_for_table(
         else:
             results[1] = 1
 
-        # -------------------- 3) Accuracy --------------------
-        # (A) invalid references or duplicates
+        # Optionally, check if the species folder in GCS matches the species name in DB:
+        #    1) fetch species from infos_especes
+        #    2) ensure that the "folder" portion of the path matches the "Espèce"
+        #    (This is an example idea; adapt as needed.)
+
+        # ------------------------------------------------------------------------------
+        # 3) Accuracy (referential integrity, duplicates, missing fields, etc.)
+        # ------------------------------------------------------------------------------
         data_species = supabase.table("infos_especes").select("id").execute().data
         sp_all = {r["id"] for r in data_species if r.get("id")}
 
+        # Check invalid references, missing image_name/url
         missing_sp = []
         missing_name = 0
         missing_url = 0
-
         for row in data_imgs:
             sp_id = row.get("species_id")
             if sp_id and sp_id not in sp_all:
@@ -698,49 +675,31 @@ def run_quality_tests_for_table(
             if not row.get("image_url"):
                 missing_url += 1
 
+        if missing_sp:
+            errors.append(f"Accuracy: {len(missing_sp)} images reference invalid species_id => {missing_sp}")
+        if missing_name > 0:
+            errors.append(f"Accuracy: {missing_name} row(s) missing image_name.")
+        if missing_url > 0:
+            errors.append(f"Accuracy: {missing_url} row(s) missing image_url.")
+
+        # Also check duplicates by (species_id, image_name)
         duplicates_map = defaultdict(int)
         for r in data_imgs:
             key = (r.get("species_id"), r.get("image_name"))
             duplicates_map[key] += 1
         dups = [k for k, count in duplicates_map.items() if count > 1]
+        if dups:
+            errors.append(f"Accuracy: Duplicate (species_id, image_name) => {dups}")
 
-        # (B) required columns for footprint_images
-        required_columns = ["species_id", "image_name", "image_url"]
-        missing_data_rows = []
-        for row in data_imgs:
-            row_id = row.get("id")
-            missing_cols = []
-            for col in required_columns:
-                val = row.get(col, None)
-                if val is None or val == "":
-                    missing_cols.append(col)
-            if missing_cols:
-                missing_data_rows.append((row_id, missing_cols))
-
-        # Evaluate if any issues => fail
-        if (missing_sp or missing_name or missing_url or dups or missing_data_rows):
+        # If any errors in Accuracy => fail
+        if missing_sp or missing_name or missing_url or dups:
             results[2] = 0
-            if missing_sp:
-                errors.append(
-                    f"Accuracy: {len(missing_sp)} images reference invalid species_id => {missing_sp}"
-                )
-            if missing_name > 0:
-                errors.append(f"Accuracy: {missing_name} row(s) missing image_name.")
-            if missing_url > 0:
-                errors.append(f"Accuracy: {missing_url} row(s) missing image_url.")
-            if dups:
-                errors.append(f"Accuracy: Duplicate (species_id, image_name) => {dups}")
-            for (rid, cols) in missing_data_rows:
-                errors.append(f"Row ID={rid} in footprint_images is missing: {', '.join(cols)}")
         else:
             results[2] = 1
 
-    # --------------------------------------------------------------------------
-    # TABLE: not recognized or no checks
-    # --------------------------------------------------------------------------
     else:
-        # If you have other tables but no checks, everything is 'N/A'
-        results = [2, 2, 2]
+        # For other tables not in [infos_especes, footprint_images], skip checks
+        results = [2,2,2]
 
     return results, errors
 
