@@ -94,38 +94,23 @@ AUGMENT_PIPE = A.Compose([
 ])
 
 
-def augment_and_balance(
-    tmp_proc: str,
-    species_name: str,
-    current_count: int,
-    gcs_bucket,
-    class_prefix: str
-):
-    """
-    Ensures each species reaches TARGET_IMAGES_PER_SPECIES
-    by writing augmented files into `tmp_proc` and uploading
-    them to GCS under AUG_FOLDER_PREFIX.
-    """
+def augment_and_balance(original_paths: list[str],    # CHANGED
+                        species_name: str,
+                        current_count: int,
+                        gcs_bucket):
     deficit = TARGET_IMAGES_PER_SPECIES - current_count
-    if deficit <= 0:
+    if deficit <= 0 or not original_paths:
         return 0, []
 
-    # List already-processed images for this species in tmp_proc
-    orig_prefix = f"{species_name.lower()}_"          # adjust to your real naming
-    originals = [
-        os.path.join(tmp_proc, f) 
-        for f in os.listdir(tmp_proc) 
-        if f.lower().startswith(orig_prefix)
-    ]
-    n_augm = min(deficit, len(originals) * AUG_PER_ORIGINAL_MAX)
-    created_meta = []  
+    n_augm = min(deficit, len(original_paths) * AUG_PER_ORIGINAL_MAX)
+    created_meta = []
 
     for i in range(n_augm):
-        src = originals[i % len(originals)]
+        src = original_paths[i % len(original_paths)]   
         img = np.array(Image.open(src).convert("RGB"))
         aug_img = AUGMENT_PIPE(image=img)["image"]
         aug_name = f"aug_{i}_{os.path.basename(src)}"
-        local_aug_path = os.path.join(tmp_proc, aug_name)
+        local_aug_path = os.path.join(os.path.dirname(src), aug_name)
         Image.fromarray(aug_img).save(local_aug_path)
 
         gcs_path = f"{AUG_FOLDER_PREFIX}{species_name}/{aug_name}"
@@ -339,6 +324,7 @@ def process_images(
     raw_folder_prefix: str = "Mammifères/",
     processed_folder_prefix: str = "processed_data/"
 ):
+    species_originals = defaultdict(list)  
     gcs_client = get_gcs_client()
     bucket = gcs_client.bucket(bucket_name)
 
@@ -405,6 +391,7 @@ def process_images(
             with Image.open(local_raw_path) as im:
                 im_resized = im.resize((128, 128))
                 im_resized.save(local_proc_path)
+                species_originals[species_name].append(local_proc_path)
         except Exception as e:
             print(f"Error resizing {blob_name}: {e}")
             continue
@@ -462,7 +449,8 @@ def process_images(
     # call your helper for each species
     aug_meta_total = [] 
     for sp, count in species_counts.items():
-        added, meta = augment_and_balance(tmp_proc, sp, count, bucket, processed_folder_prefix)
+        originals = species_originals.get(sp, [])                     # NEW
+        added, meta = augment_and_balance(originals, sp, count, bucket)  # CHANGED
         species_counts[sp] += added
         added_total += added
         aug_meta_total.extend(meta)
