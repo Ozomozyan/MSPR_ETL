@@ -30,6 +30,8 @@ from PIL import Image
 from google.cloud import storage
 from supabase import create_client, Client
 
+import albumentations as A
+
 # -------------------------------------------------------------------------
 # 1. CONNECT TO SUPABASE
 # -------------------------------------------------------------------------
@@ -76,6 +78,77 @@ def maybe_reset_tables(supabase: Client):
             f"Skipping reset: infos_especes has {count_especes} row(s), "
             f"footprint_images has {count_images} row(s)."
         )
+
+# ─────── Data-set balancing targets ───────
+TARGET_IMAGES_PER_SPECIES = int(os.getenv("TARGET_IMAGES_PER_SPECIES", 500))
+AUG_FOLDER_PREFIX = "augmented_data/"
+AUG_PER_ORIGINAL_MAX  = 3          # safety: don’t explode storage
+
+# ─────── Albumentations transforms ───────
+AUGMENT_PIPE = A.Compose([
+    A.RandomRotate90(),
+    A.HorizontalFlip(),
+    A.VerticalFlip(),
+    A.RandomBrightnessContrast(p=0.2),
+    A.GaussianBlur(p=0.2),
+])
+
+
+def augment_and_balance(
+    tmp_proc: str,
+    species_name: str,
+    current_count: int,
+    gcs_bucket,
+    class_prefix: str
+):
+    """
+    Ensures each species reaches TARGET_IMAGES_PER_SPECIES
+    by writing augmented files into `tmp_proc` and uploading
+    them to GCS under AUG_FOLDER_PREFIX.
+    """
+    deficit = TARGET_IMAGES_PER_SPECIES - current_count
+    if deficit <= 0:
+        return 0, []
+
+    # List already-processed images for this species in tmp_proc
+    originals = [os.path.join(tmp_proc, f) for f in os.listdir(tmp_proc)]
+    n_augm = min(deficit, len(originals) * AUG_PER_ORIGINAL_MAX)
+    created_meta = []  
+
+    for i in range(n_augm):
+        src = originals[i % len(originals)]
+        img = np.array(Image.open(src).convert("RGB"))
+        aug_img = AUGMENT_PIPE(image=img)["image"]
+        aug_name = f"aug_{i}_{os.path.basename(src)}"
+        local_aug_path = os.path.join(tmp_proc, aug_name)
+        Image.fromarray(aug_img).save(local_aug_path)
+
+        gcs_path = f"{AUG_FOLDER_PREFIX}{species_name}/{aug_name}"
+        gcs_bucket.blob(gcs_path).upload_from_filename(local_aug_path)
+        
+        created_meta.append(
+            (species_name, aug_name,
+             f"https://storage.googleapis.com/{gcs_bucket.name}/{gcs_path}")
+        )
+
+    return n_augm, created_meta
+
+
+def write_dataset_manifest(supabase, species_counts: dict):
+    now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    commit = os.getenv("GIT_COMMIT", "unknown")
+    script_hash = hashlib.sha256(open(__file__, "rb").read()).hexdigest()
+    manifest = {
+        "version_id": f"{now}-{commit[:7]}",
+        "created_at": now,
+        "git_commit": commit,
+        "total_images": sum(species_counts.values()),
+        "images_per_species": species_counts,
+        "etl_script_sha256": script_hash,
+    }
+    supabase.table("dataset_versions").insert(manifest).execute()
+    print(f"Dataset version recorded: {manifest['version_id']}")
+
 
 # -------------------------------------------------------------------------
 # 4. FILL/UPDATE INFOS_ESPECES
@@ -370,6 +443,41 @@ def process_images(
                     .execute()
         else:
             supabase.table("footprint_images").insert(record).execute()
+            
+    # ─── Data augmentation & class balancing ───
+    # At this point all the originals are in GCS and in the DB.
+    # Now ensure each species hits TARGET_IMAGES_PER_SPECIES by augmenting.
+    added_total = 0
+    # you’ll need to know how many originals you just uploaded per species:
+    # build that map from images_to_upload
+    species_counts = defaultdict(int)
+    for _, sp_name, _ in images_to_upload:
+        species_counts[sp_name] += 1
+
+    # call your helper for each species
+    aug_meta_total = [] 
+    for sp, count in species_counts.items():
+        added, meta = augment_and_balance(tmp_proc, sp, count, bucket, processed_folder_prefix)
+        species_counts[sp] += added
+        added_total += added
+        aug_meta_total.extend(meta)
+    print(f"Data augmentation: generated {added_total} extra images.")
+    
+    # ─── NEW: upsert augments into footprint_images ───
+    for sp_name, filename, url in aug_meta_total:
+        record = {
+            "species_id": species_map[sp_name],
+            "image_name": filename,
+            "image_url": url,
+            "is_augmented": True,
+        }
+        supabase.table("footprint_images") \
+            .upsert(record, on_conflict=["species_id", "image_name"]).execute()
+
+    # If you want those augmented images to show up in footprint_images,
+    # you can either upsert them here just like the originals,
+    # or let your next pipeline (training) discover them by reading GCS.
+
 
     # Fill missing image_name/image_url if possible
     fill_missing_image_fields(supabase, bucket_name, processed_folder_prefix)
@@ -378,6 +486,7 @@ def process_images(
     cleanup_duplicates_in_footprint_images(supabase)
 
     print("Image processing complete.")
+    return species_counts 
 
 def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_folder_prefix: str):
     """
@@ -728,7 +837,9 @@ def main():
         overall_errors.append(f"Error in infos_especes step: {e}")
 
     try:
-        process_images(supabase, BUCKET_NAME, "Mammifères/", "processed_data/")
+        species_counts = process_images(
+            supabase, BUCKET_NAME, "Mammifères/", "processed_data/"
+        )
     except Exception as e:
         overall_success = False
         overall_errors.append(f"Error in process_images: {e}")
@@ -748,6 +859,11 @@ def main():
         "test_results": "[1]" if overall_success else "[0]",
         "error_description": ("No errors" if overall_success else "; ".join(overall_errors))
     }).execute()
+    
+    try:
+        write_dataset_manifest(supabase, species_counts)
+    except Exception as e:
+        print(f"Could not write dataset manifest: {e}")
 
 if __name__ == "__main__":
     main()
