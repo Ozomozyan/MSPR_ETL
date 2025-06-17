@@ -456,7 +456,7 @@ def process_images(
         aug_meta_total.extend(meta)
     print(f"Data augmentation: generated {added_total} extra images.")
     
-    # ─── NEW: upsert augments into footprint_images ───
+    # ─── NEW / FIXED upsert augments into footprint_images ───
     for sp_name, filename, url in aug_meta_total:
         record = {
             "species_id": species_map[sp_name],
@@ -465,7 +465,12 @@ def process_images(
             "is_augmented": True,
         }
         supabase.table("footprint_images") \
-            .upsert(record, on_conflict=["species_id", "image_name"]).execute()
+            .upsert(
+                record,
+                on_conflict="species_id,image_name",    # <- one comma-separated string
+                returning="minimal"                     # <- optional but faster
+            ) \
+            .execute()
 
     # If you want those augmented images to show up in footprint_images,
     # you can either upsert them here just like the originals,
