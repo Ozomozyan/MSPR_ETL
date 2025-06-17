@@ -330,6 +330,8 @@ def process_images(
 
     # We assume now that 'infos_especes' is complete enough that foreign keys are valid
     species_map = fetch_species_map(supabase)
+    
+    fill_missing_image_fields(supabase, bucket_name, processed_folder_prefix)
 
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
     image_candidates = []
@@ -470,7 +472,7 @@ def process_images(
             .update({"image_name": filename, "is_augmented": True}) \
             .eq("species_id", record["species_id"]) \
             .eq("image_url", url) \
-            .is_("image_name", None) \
+            .or_("image_name.is.null,image_name.eq.")\
             .execute()
 
         # 2️⃣ Then do the normal upsert (won't duplicate now)
