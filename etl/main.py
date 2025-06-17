@@ -111,7 +111,12 @@ def augment_and_balance(
         return 0, []
 
     # List already-processed images for this species in tmp_proc
-    originals = [os.path.join(tmp_proc, f) for f in os.listdir(tmp_proc)]
+    orig_prefix = f"{species_name.lower()}_"          # adjust to your real naming
+    originals = [
+        os.path.join(tmp_proc, f) 
+        for f in os.listdir(tmp_proc) 
+        if f.lower().startswith(orig_prefix)
+    ]
     n_augm = min(deficit, len(originals) * AUG_PER_ORIGINAL_MAX)
     created_meta = []  
 
