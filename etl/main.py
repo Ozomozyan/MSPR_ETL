@@ -464,11 +464,21 @@ def process_images(
             "image_url": url,
             "is_augmented": True,
         }
+
+        # 1️⃣ First, try to FIX an older row that has the same URL but a NULL image_name
+        supabase.table("footprint_images") \
+            .update({"image_name": filename, "is_augmented": True}) \
+            .eq("species_id", record["species_id"]) \
+            .eq("image_url", url) \
+            .is_("image_name", None) \
+            .execute()
+
+        # 2️⃣ Then do the normal upsert (won't duplicate now)
         supabase.table("footprint_images") \
             .upsert(
                 record,
-                on_conflict="species_id,image_name",    # <- one comma-separated string
-                returning="minimal"                     # <- optional but faster
+                on_conflict="species_id,image_name",
+                returning="minimal"
             ) \
             .execute()
 
@@ -553,6 +563,18 @@ def cleanup_duplicates_in_footprint_images(supabase: Client):
             
             for dup in rows_to_delete:
                 supabase.table("footprint_images").delete().eq("id", dup["id"]).execute()
+                
+    # ─── extra dedup by URL (handles early rows with NULL image_name) ───
+    url_map = defaultdict(list)
+    for row in all_rows:
+        key = (row.get("species_id"), row.get("image_url"))
+        url_map[key].append(row)
+
+    for (sp_id, url), duprows in url_map.items():
+        if url and len(duprows) > 1:
+            duprows.sort(key=lambda r: r["id"])
+            for d in duprows[1:]:
+                supabase.table("footprint_images").delete().eq("id", d["id"]).execute()
                 
                 
 def cleanup_duplicates_in_infos_especes(supabase: Client):
