@@ -80,27 +80,18 @@ def maybe_reset_tables(supabase: Client):
         )
 
 # ─────── Data-set balancing targets ───────
-TARGET_IMAGES_PER_SPECIES = int(os.getenv("TARGET_IMAGES_PER_SPECIES", 150))
+TARGET_IMAGES_PER_SPECIES = int(os.getenv("TARGET_IMAGES_PER_SPECIES", 500))
 AUG_FOLDER_PREFIX = "augmented_data/"
 AUG_PER_ORIGINAL_MAX  = 3          # safety: don’t explode storage
 
 # ─────── Albumentations transforms ───────
-# keep probability-heavy but *diverse* ops
 AUGMENT_PIPE = A.Compose([
-    A.Rotate(limit=15),                            # ±15° random tilt
-    A.ShiftScaleRotate(shift_limit=0.05,
-                       scale_limit=0.10,
-                       rotate_limit=0, p=0.5),     # zoom & small shift
-    A.HorizontalFlip(p=.5),
-    A.VerticalFlip(p=.3),
-    A.RandomBrightnessContrast(p=.4),
-    A.GaussianBlur(blur_limit=3, p=.3),
-    A.CoarseDropout(max_holes=2, max_height=16,
-                    max_width=16, fill_value=0, p=.3),  # mud / occlusion
-], p=1.0)
-
-# processed JPEGS will now be 224×224 so we keep detail for the rotations
-PROCESSED_IMG_SIZE = 224
+    A.RandomRotate90(),
+    A.HorizontalFlip(),
+    A.VerticalFlip(),
+    A.RandomBrightnessContrast(p=0.2),
+    A.GaussianBlur(p=0.2),
+])
 
 
 def augment_and_balance(original_paths: list[str],    # CHANGED
@@ -340,14 +331,6 @@ def process_images(
     # We assume now that 'infos_especes' is complete enough that foreign keys are valid
     species_map = fetch_species_map(supabase)
     
-    # ── how many images are already in the DB per species_id ──────────────
-    current_db_counts = defaultdict(int)
-    rows = supabase.table("footprint_images").select("species_id").execute().data
-    for r in rows:
-        if r["species_id"] is not None:
-            current_db_counts[r["species_id"]] += 1
-
-    
     fill_missing_image_fields(supabase, bucket_name, processed_folder_prefix)
 
     raw_blobs = bucket.list_blobs(prefix=raw_folder_prefix)
@@ -408,8 +391,7 @@ def process_images(
         local_proc_path = os.path.join(tmp_proc, image_filename)
         try:
             with Image.open(local_raw_path) as im:
-                im_resized = im.resize((PROCESSED_IMG_SIZE,
-                                        PROCESSED_IMG_SIZE))
+                im_resized = im.resize((128, 128))
                 im_resized.save(local_proc_path)
                 species_originals[species_name].append(local_proc_path)
         except Exception as e:
@@ -457,34 +439,24 @@ def process_images(
             supabase.table("footprint_images").insert(record).execute()
             
     # ─── Data augmentation & class balancing ───
+    # At this point all the originals are in GCS and in the DB.
+    # Now ensure each species hits TARGET_IMAGES_PER_SPECIES by augmenting.
     added_total = 0
-
-    # how many originals we *just* uploaded in this run
-    species_uploads = defaultdict(int)
+    # you’ll need to know how many originals you just uploaded per species:
+    # build that map from images_to_upload
+    species_counts = defaultdict(int)
     for _, sp_name, _ in images_to_upload:
-        species_uploads[sp_name] += 1
+        species_counts[sp_name] += 1
 
-    aug_meta_total = []
-    for sp_name, uploaded in species_uploads.items():
-        originals = species_originals.get(sp_name, [])
-
-        # real-world images already present in DB *before* today + today’s uploads
-        already = current_db_counts[species_map[sp_name]] + uploaded
-
-        added, meta = augment_and_balance(
-            originals,
-            sp_name,
-            already,        # pass the true current count
-            bucket
-        )
+    # call your helper for each species
+    aug_meta_total = [] 
+    for sp, count in species_counts.items():
+        originals = species_originals.get(sp, [])                     # NEW
+        added, meta = augment_and_balance(originals, sp, count, bucket)  # CHANGED
+        species_counts[sp] += added
         added_total += added
         aug_meta_total.extend(meta)
-
-        # update our running total so the manifest is correct
-        current_db_counts[species_map[sp_name]] = already + added
-
     print(f"Data augmentation: generated {added_total} extra images.")
-
     
     # ─── NEW / FIXED upsert augments into footprint_images ───
     for sp_name, filename, url in aug_meta_total:
@@ -523,13 +495,8 @@ def process_images(
     # After filling, remove duplicates
     cleanup_duplicates_in_footprint_images(supabase)
 
-    species_counts = {
-        sp_name: current_db_counts[species_map[sp_name]]
-        for sp_name in species_map.keys()
-    }
-
-    print("Final per-species totals:", species_counts)
-    return species_counts
+    print("Image processing complete.")
+    return species_counts 
 
 def fill_missing_image_fields(supabase: Client, bucket_name: str, processed_folder_prefix: str):
     """
