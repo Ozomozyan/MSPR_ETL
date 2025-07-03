@@ -85,13 +85,25 @@ AUG_FOLDER_PREFIX = "augmented_data/"
 AUG_PER_ORIGINAL_MAX  = 3          # safety: don’t explode storage
 
 # ─────── Albumentations transforms ───────
+# keep probability-heavy but *diverse* ops
 AUGMENT_PIPE = A.Compose([
-    A.RandomRotate90(),
-    A.HorizontalFlip(),
-    A.VerticalFlip(),
-    A.RandomBrightnessContrast(p=0.2),
-    A.GaussianBlur(p=0.2),
-])
+    A.Rotate(limit=15),                            # ±15° random tilt
+    A.ShiftScaleRotate(shift_limit=0.05,
+                       scale_limit=0.10,
+                       rotate_limit=0, p=0.5),     # zoom & small shift
+    A.HorizontalFlip(p=.5),
+    A.VerticalFlip(p=.3),
+    A.RandomBrightnessContrast(p=.4),
+    A.GaussianBlur(blur_limit=3, p=.3),
+    A.CoarseDropout(max_holes=2, max_height=16,
+                    max_width=16, fill_value=0, p=.3),  # mud / occlusion
+], p=1.0)
+
+# processed JPEGS will now be 224×224 so we keep detail for the rotations
+PROCESSED_IMG_SIZE = 224
+
+# stronger variety → you need fewer copies
+AUG_PER_ORIGINAL_MAX = 1            # one augment per original is plenty
 
 
 def augment_and_balance(original_paths: list[str],    # CHANGED
@@ -391,7 +403,8 @@ def process_images(
         local_proc_path = os.path.join(tmp_proc, image_filename)
         try:
             with Image.open(local_raw_path) as im:
-                im_resized = im.resize((128, 128))
+                im_resized = im.resize((PROCESSED_IMG_SIZE,
+                                        PROCESSED_IMG_SIZE))
                 im_resized.save(local_proc_path)
                 species_originals[species_name].append(local_proc_path)
         except Exception as e:
